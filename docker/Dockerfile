@@ -823,5 +823,8 @@ ENTRYPOINT ["./sagemaker-entrypoint.sh"]
 
 FROM vllm-openai-base AS vllm-openai
 
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --system transformers==5.5.4
+
 ENTRYPOINT ["vllm", "serve"]
 #################### OPENAI API SERVER ####################
