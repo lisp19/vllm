@@ -1,3 +1,36 @@
+# Gemma 4 Turing Build
+
+This branch contains fixes to run Gemma 4 with `int8_per_token_head` KV cache quantization on Turing architecture GPUs (e.g., T4, RTX 20xx series, SM 7.5).
+
+## Build Instructions
+
+Use the following command to build the Docker image:
+
+```bash
+DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile \
+  --target vllm-openai \
+  --build-arg CUDA_VERSION=12.9.1 \
+  --build-arg torch_cuda_arch_list="7.5" \
+  --build-arg max_jobs=32 \
+  --build-arg nvcc_threads=1 \
+  -t local/vllm-gemma4:sm7.5 .
+```
+
+## Fixes Included
+
+This branch combines two sets of changes:
+
+1.  **Gemma 4 INT8 Alignment (`fix-gemma4-int8-alignment-pr`)**:
+    *   Adds a mechanism for manual KV cache page size padding.
+    *   Pads Gemma 4's global attention layers to ensure memory alignment with local attention layers, fixing the `page size not divisible` error.
+    *   Corrects tensor shape calculations in `GpuModelRunner` to account for this padding.
+
+2.  **Turing Enhancements (`gemma4_turing_enhancement`)**:
+    *   Reduces Triton kernel tile and block sizes to accommodate the 64KB shared memory limit on Turing GPUs, fixing `tl.dot` assertion errors.
+
+These fixes together enable stable execution of Gemma 4 on sm7.5 hardware.
+
+---
 <!-- markdownlint-disable MD001 MD041 -->
 <p align="center">
   <picture>
@@ -49,8 +82,7 @@ vLLM is flexible and easy to use with:
 - OpenAI-compatible API server, plus Anthropic Messages API and gRPC support
 - Efficient multi-LoRA support for dense and MoE layers
 - Support for NVIDIA GPUs, AMD GPUs, and x86/ARM/PowerPC CPUs. Additionally, diverse hardware plugins such as Google TPUs, Intel Gaudi, IBM Spyre, Huawei Ascend, Rebellions NPU, Apple Silicon, MetaX GPU, and more.
-
-vLLM seamlessly supports 200+ model architectures on HuggingFace, including:
+- vLLM seamlessly supports 200+ model architectures on HuggingFace, including:
 
 - Decoder-only LLMs (e.g., Llama, Qwen, Gemma)
 - Mixture-of-Expert LLMs (e.g., Mixtral, DeepSeek-V3, Qwen-MoE, GPT-OSS)
