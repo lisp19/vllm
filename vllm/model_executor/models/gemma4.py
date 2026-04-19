@@ -326,6 +326,21 @@ class Gemma4Attention(nn.Module):
         self.is_sliding = layer_type == "sliding_attention"
         sliding_window = config.sliding_window if self.is_sliding else None
 
+        # Gemma4 has hybrid attention with global (512) and local (256) layers.
+        # Per-token-head quantization adds 4 bytes of scale per head.
+        #  - Local: (256*1)*2 + 8 = 520 bytes
+        #  - Global: (512*1)*2 + 8 = 1032 bytes
+        # 1032 is not divisible by 520, so we pad Global to 1040 (520*2).
+        kv_cache_page_size_padded = None
+        if cache_config is not None and cache_config.cache_dtype in (
+                "int8_per_token_head", "fp8_per_token_head"):
+            if self.head_dim == 512:
+                # Calculate per-GPU num_kv_heads
+                tp_size = get_tensor_model_parallel_world_size()
+                num_kv_heads_per_gpu = max(1, num_kv_heads // tp_size)
+                kv_cache_page_size_padded = (cache_config.block_size *
+                                             num_kv_heads_per_gpu * 1040)
+
         # Initialize RoPE based on layer type.
         # Gemma4 uses different RoPE parameters for sliding vs full attention.
         if layer_type in config.rope_parameters:
@@ -389,6 +404,7 @@ class Gemma4Attention(nn.Module):
             logits_soft_cap=attn_logits_soft_cap,
             per_layer_sliding_window=sliding_window,
             kv_sharing_target_layer_name=kv_sharing_target_layer_name,
+            kv_cache_page_size_padded=kv_cache_page_size_padded,
             prefix=f"{prefix}.attn",
         )
 
@@ -427,20 +443,6 @@ class Gemma4Attention(nn.Module):
         output, _ = self.o_proj(attn_output)
 
         return output
-
-    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> "KVCacheSpec":
-        spec = self.attn.get_kv_cache_spec(vllm_config)
-
-        # Gemma4 has hybrid attention with global (512) and local (256) layers.
-        # Per-token-head quantization adds 4 bytes of scale per head.
-        #  - Local: (256*1)*2 + 8 = 520 bytes
-        #  - Global: (512*1)*2 + 8 = 1032 bytes
-        # 1032 is not divisible by 520, so we pad Global to 1040 (520*2).
-        if spec.kv_quant_mode.is_per_token_head and self.head_dim == 512:
-            padded_page_size = spec.block_size * spec.num_kv_heads * 1040
-            return replace(spec, page_size_padded=padded_page_size)
-
-        return spec
 
 
 class Gemma4DecoderLayer(nn.Module):
