@@ -428,6 +428,20 @@ class Gemma4Attention(nn.Module):
 
         return output
 
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> "KVCacheSpec":
+        spec = self.attn.get_kv_cache_spec(vllm_config)
+
+        # Gemma4 has hybrid attention with global (512) and local (256) layers.
+        # Per-token-head quantization adds 4 bytes of scale per head.
+        #  - Local: (256*1)*2 + 8 = 520 bytes
+        #  - Global: (512*1)*2 + 8 = 1032 bytes
+        # 1032 is not divisible by 520, so we pad Global to 1040 (520*2).
+        if spec.kv_quant_mode.is_per_token_head and self.head_dim == 512:
+            padded_page_size = spec.block_size * spec.num_kv_heads * 1040
+            return replace(spec, page_size_padded=padded_page_size)
+
+        return spec
+
 
 class Gemma4DecoderLayer(nn.Module):
     def __init__(
