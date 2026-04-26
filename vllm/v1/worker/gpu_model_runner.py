@@ -4947,13 +4947,16 @@ class GPUModelRunner(
 
         hf_config = self.speculative_config.draft_model_config.hf_config
 
+        is_dflash = self.speculative_config.method == "dflash"
         layer_ids = getattr(hf_config, "eagle_aux_hidden_state_layer_ids", None)
-        if not layer_ids:
+        if is_dflash or not layer_ids:
             dflash_config = getattr(hf_config, "dflash_config", None)
             if dflash_config and isinstance(dflash_config, dict):
                 layer_ids = dflash_config.get("target_layer_ids")
 
         if layer_ids and isinstance(layer_ids, (list, tuple)):
+            if is_dflash:
+                return tuple(layer_id + 1 for layer_id in layer_ids)
             return tuple(layer_ids)
 
         return None
