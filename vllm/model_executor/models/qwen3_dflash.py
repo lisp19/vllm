@@ -47,6 +47,30 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+_DFLASH_VALID_LAYER_TYPES = frozenset({"full_attention", "sliding_attention"})
+
+
+def _get_dflash_layer_types(config: Qwen3Config) -> tuple[str, ...]:
+    layer_types = getattr(config, "layer_types", None)
+    if layer_types is None:
+        return ("full_attention",) * config.num_hidden_layers
+    if len(layer_types) != config.num_hidden_layers:
+        raise ValueError(
+            f"DFlash layer_types length {len(layer_types)} does not match "
+            f"num_hidden_layers {config.num_hidden_layers}."
+        )
+    invalid = set(layer_types) - _DFLASH_VALID_LAYER_TYPES
+    if invalid:
+        raise ValueError(f"Invalid DFlash layer_type(s): {sorted(invalid)}.")
+    if "sliding_attention" in layer_types and not getattr(
+        config, "sliding_window", None
+    ):
+        raise ValueError(
+            "DFlash sliding_attention layers require `sliding_window` in config."
+        )
+    return tuple(layer_types)
+
+
 class DFlashQwen3Attention(nn.Module):
     """Attention for DFlash speculative decoding.
 
@@ -66,6 +90,7 @@ class DFlashQwen3Attention(nn.Module):
         attention_bias: bool = False,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
+        sliding_window: int | None = None,
         prefix: str = "",
         attn_type: str = AttentionType.DECODER,
     ) -> None:
@@ -116,9 +141,13 @@ class DFlashQwen3Attention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             cache_config=cache_config,
             quant_config=quant_config,
+            per_layer_sliding_window=sliding_window,
             prefix=f"{prefix}.attn",
             attn_type=attn_type,
         )
+        if sliding_window is not None:
+            # DFlash keeps full KV allocation while using SWA only for compute.
+            self.attn.sliding_window = None
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
@@ -158,12 +187,17 @@ class DFlashQwen3DecoderLayer(nn.Module):
         config: Qwen3Config,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
+        layer_type: str = "full_attention",
         prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.layer_type = layer_type
         set_default_rope_theta(config, default_theta=1000000)
         attn_type = AttentionType.DECODER
+        sliding_window = (
+            config.sliding_window if layer_type == "sliding_attention" else None
+        )
 
         self.self_attn = DFlashQwen3Attention(
             hidden_size=self.hidden_size,
@@ -175,6 +209,7 @@ class DFlashQwen3DecoderLayer(nn.Module):
             head_dim=getattr(config, "head_dim", None),
             cache_config=cache_config,
             quant_config=quant_config,
+            sliding_window=sliding_window,
             rope_parameters=config.rope_parameters,
             prefix=f"{prefix}.self_attn",
             attn_type=attn_type,
@@ -243,16 +278,23 @@ class DFlashQwen3Model(nn.Module):
             prefix=maybe_prefix(prefix, "embed_tokens"),
         )
 
+        self.layer_types = _get_dflash_layer_types(self.config)
         self.layers = nn.ModuleList(
             [
                 DFlashQwen3DecoderLayer(
                     current_vllm_config,
                     prefix=maybe_prefix(prefix, f"layers.{layer_idx + start_layer_id}"),
                     config=self.config,
+                    layer_type=self.layer_types[layer_idx],
                 )
                 for layer_idx in range(self.config.num_hidden_layers)
             ]
         )
+        self.sliding_attention_layer_names = {
+            layer.self_attn.attn.layer_name
+            for layer in self.layers
+            if layer.layer_type == "sliding_attention"
+        }
         if self.use_aux_hidden_state:
             num_features_to_use = self.config.num_hidden_layers
             if "target_layer_ids" in drafter_config:
@@ -521,7 +563,9 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(
-            self.config.draft_vocab_size, scale=logit_scale
+            self.config.draft_vocab_size,
+            scale=logit_scale,
+            soft_cap=getattr(self.config, "final_logit_softcapping", None),
         )
         target_vocab_size = vllm_config.model_config.get_vocab_size()
         if self.config.draft_vocab_size != target_vocab_size:
@@ -575,6 +619,10 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         self.model.precompute_and_store_context_kv(
             context_states, context_positions, context_slot_mapping
         )
+
+    @property
+    def sliding_attention_layer_names(self) -> set[str]:
+        return self.model.sliding_attention_layer_names
 
     def combine_hidden_states(
         self,
