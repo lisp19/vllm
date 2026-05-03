@@ -723,7 +723,7 @@ RUN --mount=type=bind,from=build,src=/tmp/ep_kernels_workspace/dist,target=/vllm
 # those can reinstall/touch flashinfer packages. Downloading cubins earlier
 # (in the flashinfer-jit-cache layer) causes ~2.5 GB of layer duplication
 # when a later pip install overwrites flashinfer package files.
-RUN flashinfer show-config && flashinfer download-cubin
+# RUN flashinfer show-config && flashinfer download-cubin
 
 # CUDA image changed from /usr/local/nvidia to /usr/local/cuda in 12.8 but will
 # return to /usr/local/nvidia in 13.0 to allow container providers to mount drivers
