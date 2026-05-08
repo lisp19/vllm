@@ -1701,25 +1701,53 @@ class EngineArgs:
         # These layers are most sensitive to quantization error.
         # Users can add extra layers via --kv-cache-dtype-skip-layers.
         if resolved_cache_dtype.startswith("turboquant_"):
-            if model_config.is_hybrid:
-                raise NotImplementedError(
-                    "TurboQuant KV cache is not supported for hybrid "
-                    "(attention + Mamba) models. Boundary layer protection "
-                    "requires uniform attention layers."
-                )
             from vllm.model_executor.layers.quantization.turboquant.config import (
                 TurboQuantConfig,
             )
 
-            num_layers = model_config.hf_text_config.num_hidden_layers
-            boundary = TurboQuantConfig.get_boundary_skip_layers(num_layers)
+            if model_config.is_hybrid:
+                layer_types = getattr(model_config.hf_text_config, "layer_types", None)
+                if layer_types is None:
+                    raise NotImplementedError(
+                        "TurboQuant KV cache on hybrid models currently requires "
+                        "hf_text_config.layer_types so vLLM can identify "
+                        "full_attention layers."
+                    )
+
+                if not any(
+                    layer_type == "full_attention" for layer_type in layer_types
+                ):
+                    raise NotImplementedError(
+                        "TurboQuant KV cache on hybrid models currently requires "
+                        "at least one full_attention layer."
+                    )
+
+                if cache_config.kv_cache_dtype_skip_layers:
+                    raise NotImplementedError(
+                        "TurboQuant KV cache on hybrid models does not support "
+                        "kv_cache_dtype_skip_layers because hybrid KV cache "
+                        "manager requires uniform attention page sizes."
+                    )
+
+                boundary = []
+                log_context = "hybrid full_attention; boundary protection disabled"
+                logger.warning(
+                    "TurboQuant boundary layer protection is disabled for hybrid "
+                    "models to preserve uniform attention page sizes. All "
+                    "full_attention layers will use TurboQuant."
+                )
+            else:
+                num_layers = model_config.hf_text_config.num_hidden_layers
+                boundary = TurboQuantConfig.get_boundary_skip_layers(num_layers)
+                log_context = f"num_layers={num_layers}"
+
             existing = set(cache_config.kv_cache_dtype_skip_layers)
             merged = sorted(existing | set(boundary), key=lambda x: int(x))
             cache_config.kv_cache_dtype_skip_layers = merged
             logger.info(
-                "TQ: skipping layers %s for boundary protection (num_layers=%d)",
+                "TQ: skipping layers %s for boundary protection (%s)",
                 merged,
-                num_layers,
+                log_context,
             )
 
         ray_runtime_env = None
