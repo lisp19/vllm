@@ -664,6 +664,7 @@ class TritonAttentionImpl(AttentionImpl):
                 block_table=attn_metadata.block_table,
                 layout=layout,
                 softmax_scale=self.scale,
+                softcap=self.logits_soft_cap,
                 num_queries_per_kv=self.num_queries_per_kv,
                 sliding_window=self.sliding_window,
             )

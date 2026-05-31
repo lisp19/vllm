@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 
 from vllm.v1.kv_cache_interface import PackedIntPerTokenHeadLayout
 
@@ -206,6 +205,7 @@ def paged_attention_packed_int(
     layout: PackedIntPerTokenHeadLayout,
     *,
     softmax_scale: float,
+    softcap: float,
     num_queries_per_kv: int,
     sliding_window: tuple[int, int],
 ) -> None:
@@ -249,12 +249,10 @@ def paged_attention_packed_int(
         attn_bias = torch.zeros((q_len, seq_len), device=q.device, dtype=torch.float32)
         attn_bias.masked_fill_(~keep, float("-inf"))
 
-        attn_out = F.scaled_dot_product_attention(
-            (q_seq * softmax_scale).unsqueeze(0),
-            key_seq.unsqueeze(0),
-            value_seq.unsqueeze(0),
-            attn_mask=attn_bias.view(1, 1, q_len, seq_len),
-            dropout_p=0.0,
-            is_causal=False,
-        )
-        out[q_start:q_end].copy_(attn_out.squeeze(0).permute(1, 0, 2).to(out.dtype))
+        scores = torch.matmul(q_seq, key_seq.transpose(-1, -2)) * softmax_scale
+        if softcap > 0:
+            scores = softcap * torch.tanh(scores / softcap)
+        scores = scores + attn_bias.unsqueeze(0)
+        probs = torch.softmax(scores, dim=-1)
+        attn_out = torch.matmul(probs, value_seq)
+        out[q_start:q_end].copy_(attn_out.permute(1, 0, 2).to(out.dtype))
