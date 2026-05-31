@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from dataclasses import replace
 from typing import Any
 
 import torch
@@ -67,14 +68,22 @@ class DFlashProposer(SpecDecodeBaseProposer):
         # For DFlash we use the input embeddings to embed the mask token
         self.parallel_drafting_hidden_state_tensor = None
 
-    @override
-    def _create_draft_vllm_config(self) -> VllmConfig:
-        return super()._create_draft_vllm_config()
+        self.dflash_causal = self.dflash_config.get("causal", False)
 
     @override
-    def _raise_if_multimodal(self):
+    def _create_draft_vllm_config(self) -> VllmConfig:
+        base = super()._create_draft_vllm_config()
+        return replace(
+            base,
+            attention_config=replace(
+                base.attention_config,
+                use_non_causal=not self.dflash_causal,
+            ),
+        )
+
+    @override
+    def _warn_if_multimodal(self):
         # Override to allow multimodal inputs since DFlash supports Qwen3.5 models
-        # Support for multimodal inputs has not been tested.
         pass
 
     @override
@@ -177,7 +186,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
             max_seq_len=cad.max_seq_len + num_query_per_req,
             block_table_tensor=cad.block_table_tensor,
             slot_mapping=query_slot_mapping,
-            causal=False,  # Non-causal attention is required for DFlash
+            causal=self.dflash_causal,
         )
 
         return num_query_total, token_indices_to_sample, new_cad
@@ -274,63 +283,20 @@ class DFlashProposer(SpecDecodeBaseProposer):
         per_group, per_layer = super().build_per_group_and_layer_attn_metadata(
             cad, draft_index
         )
-        sliding_layer_names = getattr(
-            self.model, "sliding_attention_layer_names", set()
-        )
-
-        # Triton paged-KV decode only supports causal attention at backend
-        # selection / kernel entry, but it can extend the causal mask with
-        # bidirectional ranges via mm_prefix_range. For DFlash, the only
-        # bidirectional region needed is the per-request query-token suffix
-        # (bonus token + mask tokens). Keep backend selection causal-compatible
-        # and inject that suffix range directly into Triton metadata.
-        query_lens = cad.query_start_loc[1:] - cad.query_start_loc[:-1]
-        query_range_tensor = torch.stack(
-            (cad.seq_lens - query_lens, cad.seq_lens - 1), dim=-1
-        ).to(dtype=torch.int32)
-        query_range_tensor = query_range_tensor.unsqueeze(1).contiguous()
-
-        if sliding_layer_names:
-            causal_cad = cad.replace(causal=True)
-            for attn_group in self.draft_attn_groups:
-                causal_layers = sliding_layer_names & set(attn_group.layer_names)
-                if not causal_layers:
-                    continue
-                attn_metadata = attn_group.get_metadata_builder().build_for_drafting(
-                    common_attn_metadata=causal_cad, draft_index=draft_index
+        if not self.dflash_causal:
+            # Require all layers to support non-causal attention when required by DFlash
+            for layer_name, attn_metadata in per_layer.items():
+                assert getattr(attn_metadata, "causal", None) is False, (
+                    f"Attention metadata for layer {layer_name} does not have"
+                    " non-causal support, which is required for DFlash."
+                    " Consider using a different attention backend, e.g FlashAttention."
                 )
-                for layer_name in causal_layers:
-                    per_layer[layer_name] = attn_metadata
-
-        for layer_name, attn_metadata in per_layer.items():
-            if layer_name in sliding_layer_names:
-                assert getattr(attn_metadata, "causal", None) is True, (
-                    f"Attention metadata for sliding layer {layer_name} does not have"
-                    " causal support, which is required for DFlash SWA."
-                )
-                continue
-            if hasattr(attn_metadata, "mm_prefix_range_tensor"):
-                attn_metadata.mm_prefix_range_tensor = query_range_tensor
-                assert (
-                    getattr(attn_metadata, "mm_prefix_range_tensor", None) is not None
-                ), (
-                    f"Attention metadata for layer {layer_name} is missing the "
-                    "query-token bidirectional mask required for DFlash."
-                )
-                continue
-            assert getattr(attn_metadata, "causal", None) is False, (
-                f"Attention metadata for layer {layer_name} does not have"
-                " non-causal support, which is required for DFlash."
-                " Consider using a different attention backend, such as FlashAttention."
-            )
         return per_group, per_layer
 
     @override
     def _get_eagle3_use_aux_hidden_state_from_config(self):
-        use_aux_hidden_state = True
-        dflash_config = getattr(
-            self.draft_model_config.hf_config, "dflash_config", None
-        )
-        if dflash_config is not None:
-            use_aux_hidden_state = dflash_config.get("use_aux_hidden_state", True)
-        return use_aux_hidden_state
+        return self.dflash_config.get("use_aux_hidden_state", True)
+
+    @property
+    def dflash_config(self):
+        return getattr(self.draft_model_config.hf_config, "dflash_config", None) or {}
