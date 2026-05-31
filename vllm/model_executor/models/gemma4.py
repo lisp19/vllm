@@ -85,6 +85,15 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+def _gemma4_packed_int_bytes_per_token_head(
+    *,
+    head_dim: int,
+    k_bits: int,
+    v_bits: int,
+) -> int:
+    return ((head_dim * k_bits + 7) // 8) + ((head_dim * v_bits + 7) // 8) + 8
+
+
 def _remap_gemma4_expert_weight_name(name: str) -> str:
     return re.sub(r"(?<!\.moe)\.experts\.(\d+)\.", r".moe.experts.\1.", name)
 
@@ -456,6 +465,31 @@ class Gemma4Attention(nn.Module):
             num_kv_heads_per_gpu = max(1, num_kv_heads // tp_size)
             kv_cache_page_size_padded = (
                 cache_config.block_size * num_kv_heads_per_gpu * 1040
+            )
+        elif (
+            cache_config is not None
+            and cache_config.cache_dtype
+            in {
+                "int8_k_int4_v_per_token_head",
+                "int4_per_token_head",
+                "intx_k_inty_v_per_token_head",
+            }
+            and self.head_dim == 512
+        ):
+            assert cache_config.kv_cache_k_bits is not None
+            assert cache_config.kv_cache_v_bits is not None
+            tp_size = get_tensor_model_parallel_world_size()
+            num_kv_heads_per_gpu = max(1, num_kv_heads // tp_size)
+            local_bytes_per_token_head = _gemma4_packed_int_bytes_per_token_head(
+                head_dim=256,
+                k_bits=cache_config.kv_cache_k_bits,
+                v_bits=cache_config.kv_cache_v_bits,
+            )
+            global_padded_bytes_per_token_head = local_bytes_per_token_head * 2
+            kv_cache_page_size_padded = (
+                cache_config.block_size
+                * num_kv_heads_per_gpu
+                * global_padded_bytes_per_token_head
             )
 
         # Initialize RoPE based on layer type.

@@ -6969,12 +6969,13 @@ class GPUModelRunner(
                         kv_cache_spec.num_kv_heads,
                         kv_cache_spec.head_size,
                         cache_dtype_str=self.cache_config.cache_dtype,
+                        packed_int_layout=kv_cache_spec.packed_int_layout,
                     )
                     dtype = kv_cache_spec.dtype
                     try:
                         kv_cache_stride_order = attn_backend.get_kv_cache_stride_order()
                         assert len(kv_cache_stride_order) == len(kv_cache_shape)
-                    except (AttributeError, NotImplementedError):
+                    except (AttributeError, NotImplementedError, AssertionError):
                         kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
                     # The allocation respects the backend-defined stride order
                     # to ensure the semantic remains consistent for each
@@ -7072,6 +7073,7 @@ class GPUModelRunner(
                 kv_cache_spec.num_kv_heads,
                 kv_cache_spec.head_size,
                 cache_dtype_str=self.cache_config.cache_dtype,
+                packed_int_layout=kv_cache_spec.packed_int_layout,
             )
             # block_dim: 0 means (num_blocks, 2, ...); 1 means (2, num_blocks, ...).
             if block_dim == 0:

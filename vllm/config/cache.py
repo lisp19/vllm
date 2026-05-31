@@ -12,6 +12,7 @@ from vllm.logger import init_logger
 from vllm.utils.torch_utils import (
     is_quantized_kv_cache,
     kv_cache_uses_per_token_head_scales,
+    resolve_packed_int_per_token_head_bits,
 )
 
 logger = init_logger(__name__)
@@ -30,6 +31,9 @@ CacheDType = Literal[
     "turboquant_k3v4_nc",
     "turboquant_3bit_nc",
     "int8_per_token_head",
+    "int8_k_int4_v_per_token_head",
+    "int4_per_token_head",
+    "intx_k_inty_v_per_token_head",
     "fp8_per_token_head",
     "nvfp4",
 ]
@@ -115,6 +119,12 @@ class CacheConfig:
     kv_cache_dtype_skip_layers: list[str] = field(default_factory=list)
     """Layer patterns to skip KV cache quantization. Accepts layer indices
     (e.g., '0', '2', '4') or attention type names (e.g., 'sliding_window')."""
+    kv_cache_k_bits: int | None = Field(default=None, ge=2, le=8)
+    """Packed-int per-token-head key bit width. Used only for
+    `intx_k_inty_v_per_token_head` and preset validation."""
+    kv_cache_v_bits: int | None = Field(default=None, ge=2, le=8)
+    """Packed-int per-token-head value bit width. Used only for
+    `intx_k_inty_v_per_token_head` and preset validation."""
     mamba_page_size_padded: int | None = None
     """ Optional override for mamba page size; used by hybrid mamba/attention
     models to ensure exact alignment with attention page size."""
@@ -241,6 +251,11 @@ class CacheConfig:
             self.user_specified_block_size = True
         if self.mamba_block_size is not None:
             self.user_specified_mamba_block_size = True
+        self.kv_cache_k_bits, self.kv_cache_v_bits = (
+            resolve_packed_int_per_token_head_bits(
+                self.cache_dtype, self.kv_cache_k_bits, self.kv_cache_v_bits
+            )
+        )
         return self
 
     @field_validator("calculate_kv_scales", mode="after")

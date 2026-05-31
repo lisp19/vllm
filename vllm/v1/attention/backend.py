@@ -24,7 +24,11 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
     from vllm.platforms.interface import DeviceCapability
     from vllm.v1.attention.backends.utils import KVCacheLayoutType
-    from vllm.v1.kv_cache_interface import AttentionSpec, KVQuantMode
+    from vllm.v1.kv_cache_interface import (
+        AttentionSpec,
+        KVQuantMode,
+        PackedIntPerTokenHeadLayout,
+    )
 
 from vllm.v1.kv_cache_interface import get_kv_quant_mode
 
@@ -92,6 +96,7 @@ class AttentionBackend(ABC):
         num_kv_heads: int,
         head_size: int,
         cache_dtype_str: str = "auto",
+        packed_int_layout: "PackedIntPerTokenHeadLayout | None" = None,
     ) -> tuple[int, ...]:
         raise NotImplementedError
 
@@ -102,6 +107,7 @@ class AttentionBackend(ABC):
         num_kv_heads: int,
         head_size: int,
         cache_dtype_str: str = "auto",
+        packed_int_layout: "PackedIntPerTokenHeadLayout | None" = None,
     ) -> int:
         """Discover which tensor dim is the block index, since different
         backends lay out dims differently."""
@@ -112,6 +118,7 @@ class AttentionBackend(ABC):
             num_kv_heads,
             head_size,
             cache_dtype_str=cache_dtype_str,
+            packed_int_layout=packed_int_layout,
         )
         return shape.index(_S)
 

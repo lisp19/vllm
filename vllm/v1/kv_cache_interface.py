@@ -41,6 +41,7 @@ class KVQuantMode(IntEnum):
     INT8_PER_TOKEN_HEAD = 2  # per-token-head dynamic scales for int8
     FP8_PER_TOKEN_HEAD = 3  # per-token-head dynamic scales for fp8
     NVFP4 = 4  # packed fp4 data + fp8 block scales
+    INT_PACKED_PER_TOKEN_HEAD = 5  # generic packed int K/V + per-token-head scales
 
     @property
     def is_per_token_head(self) -> bool:
@@ -48,6 +49,7 @@ class KVQuantMode(IntEnum):
         return self in (
             KVQuantMode.INT8_PER_TOKEN_HEAD,
             KVQuantMode.FP8_PER_TOKEN_HEAD,
+            KVQuantMode.INT_PACKED_PER_TOKEN_HEAD,
         )
 
     @property
@@ -64,6 +66,12 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
         return KVQuantMode.FP8_PER_TOKEN_HEAD
     if kv_cache_dtype == "nvfp4":
         return KVQuantMode.NVFP4
+    if kv_cache_dtype in {
+        "int8_k_int4_v_per_token_head",
+        "int4_per_token_head",
+        "intx_k_inty_v_per_token_head",
+    }:
+        return KVQuantMode.INT_PACKED_PER_TOKEN_HEAD
     if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8"):
         return KVQuantMode.FP8_PER_TENSOR
     return KVQuantMode.NONE
@@ -76,6 +84,78 @@ def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
 def kv_cache_uses_per_token_head_scales(kv_cache_dtype: str) -> bool:
     """Return True if *kv_cache_dtype* needs per-token-head scales."""
     return get_kv_quant_mode(kv_cache_dtype).is_per_token_head
+
+
+def packed_int_data_bytes(num_elements: int, bits: int) -> int:
+    return cdiv(num_elements * bits, 8)
+
+
+def resolve_packed_int_kernel_kind(k_bits: int, v_bits: int) -> str:
+    if (k_bits, v_bits) == (8, 4):
+        return "specialized_8_4"
+    if (k_bits, v_bits) == (4, 4):
+        return "specialized_4_4"
+    return "generic"
+
+
+@dataclass(frozen=True)
+class PackedIntPerTokenHeadLayout:
+    k_bits: int
+    v_bits: int
+    head_size: int
+    head_size_v: int
+    k_data_bytes: int
+    v_data_bytes: int
+    k_scale_bytes: int = 4
+    v_scale_bytes: int = 4
+    padded_bytes_per_token_head: int | None = None
+    kernel_kind: str = "generic"
+
+    @property
+    def raw_bytes_per_token_head(self) -> int:
+        return (
+            self.k_data_bytes
+            + self.v_data_bytes
+            + self.k_scale_bytes
+            + self.v_scale_bytes
+        )
+
+    @property
+    def v_data_offset_bytes(self) -> int:
+        return self.k_data_bytes
+
+    @property
+    def k_scale_offset_bytes(self) -> int:
+        return self.k_data_bytes + self.v_data_bytes
+
+    @property
+    def v_scale_offset_bytes(self) -> int:
+        return self.k_data_bytes + self.v_data_bytes + self.k_scale_bytes
+
+    @property
+    def slot_bytes(self) -> int:
+        return self.padded_bytes_per_token_head or self.raw_bytes_per_token_head
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        k_bits: int,
+        v_bits: int,
+        head_size: int,
+        head_size_v: int,
+        padded_bytes_per_token_head: int | None = None,
+    ) -> PackedIntPerTokenHeadLayout:
+        return cls(
+            k_bits=k_bits,
+            v_bits=v_bits,
+            head_size=head_size,
+            head_size_v=head_size_v,
+            k_data_bytes=packed_int_data_bytes(head_size, k_bits),
+            v_data_bytes=packed_int_data_bytes(head_size_v, v_bits),
+            padded_bytes_per_token_head=padded_bytes_per_token_head,
+            kernel_kind=resolve_packed_int_kernel_kind(k_bits, v_bits),
+        )
 
 
 class KVCacheSpecKind(str, Enum):
@@ -147,6 +227,7 @@ class AttentionSpec(KVCacheSpec):
     dtype: torch.dtype
     kv_quant_mode: KVQuantMode = KVQuantMode.NONE
     page_size_padded: int | None = None
+    packed_int_layout: PackedIntPerTokenHeadLayout | None = None
 
     def copy_with_new_block_size(self, block_size: int) -> Self:
         """
@@ -171,7 +252,7 @@ class AttentionSpec(KVCacheSpec):
         # Per-token-head scales are stored in separate tensors managed
         # by the attention backend, but the memory is carved from the
         # raw KV cache allocation so it must be budgeted here.
-        if self.kv_quant_mode.is_per_token_head:
+        if self.kv_quant_mode.is_per_token_head and self.packed_int_layout is None:
             real_page_size += (
                 2 * self.block_size * self.num_kv_heads * get_dtype_size(torch.float32)
             )
@@ -182,6 +263,12 @@ class AttentionSpec(KVCacheSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
+        if self.packed_int_layout is not None:
+            return (
+                self.block_size
+                * self.num_kv_heads
+                * self.packed_int_layout.raw_bytes_per_token_head
+            )
         if self.kv_quant_mode.is_nvfp4:
             # Packed layout: fp4 data + fp8 block scales per head.
             full_dim = nvfp4_kv_cache_full_dim(self.head_size)
@@ -275,6 +362,7 @@ class FullAttentionSpec(AttentionSpec):
             dtype=specs[0].dtype,
             kv_quant_mode=specs[0].kv_quant_mode,
             page_size_padded=specs[0].page_size_padded,
+            packed_int_layout=specs[0].packed_int_layout,
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
         )
@@ -294,6 +382,12 @@ class FullAttentionSpec(AttentionSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
+        if self.packed_int_layout is not None:
+            return (
+                self.block_size
+                * self.num_kv_heads
+                * self.packed_int_layout.raw_bytes_per_token_head
+            )
         if self.kv_quant_mode.is_nvfp4:
             # Packed layout per head: fp4 data + fp8 block scales.
             # fp4 data: head_size//2 bytes (2 fp4 values per byte)
@@ -459,6 +553,12 @@ class SlidingWindowSpec(AttentionSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
+        if self.packed_int_layout is not None:
+            return (
+                self.block_size
+                * self.num_kv_heads
+                * self.packed_int_layout.raw_bytes_per_token_head
+            )
         # Mirror ``FullAttentionSpec.real_page_size_bytes`` for NVFP4 KV cache.
         if self.kv_quant_mode.is_nvfp4:
             last_dim = nvfp4_kv_cache_full_dim(
@@ -676,6 +776,7 @@ class SinkFullAttentionSpec(FullAttentionSpec):
             dtype=specs[0].dtype,
             kv_quant_mode=specs[0].kv_quant_mode,
             page_size_padded=specs[0].page_size_padded,
+            packed_int_layout=specs[0].packed_int_layout,
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
         )

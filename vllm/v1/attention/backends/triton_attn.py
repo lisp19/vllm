@@ -19,7 +19,11 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.math_utils import next_power_of_2
-from vllm.utils.torch_utils import async_tensor_h2d, is_quantized_kv_cache
+from vllm.utils.torch_utils import (
+    async_tensor_h2d,
+    is_packed_int_per_token_head_kv_cache,
+    is_quantized_kv_cache,
+)
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -34,6 +38,11 @@ from vllm.v1.attention.backends.utils import (
     get_kv_cache_layout,
     get_num_attention_heads_from_layers,
 )
+from vllm.v1.attention.ops.triton_packed_int_kv import (
+    get_packed_int_cache_views,
+    paged_attention_packed_int,
+    reshape_and_cache_packed_int_per_token_head,
+)
 from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
@@ -43,6 +52,7 @@ from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVQuantMode,
+    PackedIntPerTokenHeadLayout,
     get_kv_quant_mode,
     kv_cache_uses_per_token_head_scales,
 )
@@ -282,6 +292,9 @@ class TritonAttentionBackend(AttentionBackend):
         "fp8_e4m3",
         "fp8_e5m2",
         "int8_per_token_head",
+        "int8_k_int4_v_per_token_head",
+        "int4_per_token_head",
+        "intx_k_inty_v_per_token_head",
         "fp8_per_token_head",
     ]
 
@@ -316,9 +329,12 @@ class TritonAttentionBackend(AttentionBackend):
         num_kv_heads: int,
         head_size: int,
         cache_dtype_str: str = "auto",
+        packed_int_layout: PackedIntPerTokenHeadLayout | None = None,
     ) -> tuple[int, ...]:
         if block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")
+        if packed_int_layout is not None:
+            return (num_blocks, block_size, num_kv_heads, packed_int_layout.slot_bytes)
         if kv_cache_uses_per_token_head_scales(cache_dtype_str):
             # Pad head_size by sizeof(float32)/sizeof(cache_dtype) so
             # the per-head scale fits inline.  The backend extracts
@@ -397,6 +413,9 @@ class TritonAttentionImpl(AttentionImpl):
     # Per-token-head quant: scale views carved from inline head padding.
     _k_scale_cache: torch.Tensor | None = None
     _v_scale_cache: torch.Tensor | None = None
+    _packed_int_key_cache: torch.Tensor | None = None
+    _packed_int_value_cache: torch.Tensor | None = None
+    _packed_int_layout: PackedIntPerTokenHeadLayout | None = None
 
     def _ensure_scale_caches(self, kv_cache: torch.Tensor) -> None:
         """Extract per-head scale views from the padded head dimension.
@@ -450,6 +469,21 @@ class TritonAttentionImpl(AttentionImpl):
         )
         self._v_scale_cache.fill_(1.0)
 
+    def _ensure_packed_int_views(
+        self,
+        kv_cache: torch.Tensor,
+        layout: PackedIntPerTokenHeadLayout,
+    ) -> None:
+        if self._packed_int_layout == layout and self._packed_int_key_cache is not None:
+            return
+        (
+            self._packed_int_key_cache,
+            self._packed_int_value_cache,
+            self._k_scale_cache,
+            self._v_scale_cache,
+        ) = get_packed_int_cache_views(kv_cache, layout)
+        self._packed_int_layout = layout
+
     def fused_output_quant_supported(self, quant_key: QuantKey):
         return quant_key == kFp8StaticTensorSym
 
@@ -468,6 +502,8 @@ class TritonAttentionImpl(AttentionImpl):
         sinks: torch.Tensor | None = None,
         use_alibi_sqrt: bool = False,
         chunk_lookback: int = -1,
+        kv_cache_k_bits: int | None = None,
+        kv_cache_v_bits: int | None = None,
     ) -> None:
         self.num_heads = num_heads
         self.head_size = head_size
@@ -483,6 +519,8 @@ class TritonAttentionImpl(AttentionImpl):
         else:
             self.sliding_window = (sliding_window - 1, 0)
         self.kv_cache_dtype = kv_cache_dtype
+        self.kv_cache_k_bits = kv_cache_k_bits
+        self.kv_cache_v_bits = kv_cache_v_bits
         if logits_soft_cap is None:
             # In flash-attn, setting logits_soft_cap as 0 means no soft cap.
             logits_soft_cap = 0
@@ -507,6 +545,9 @@ class TritonAttentionImpl(AttentionImpl):
 
         self._kv_quant_mode = get_kv_quant_mode(kv_cache_dtype)
         self._is_per_token_head_quant = self._kv_quant_mode.is_per_token_head
+        self._is_packed_int_per_token_head = is_packed_int_per_token_head_kv_cache(
+            kv_cache_dtype
+        )
 
         # Enable tensor descriptors for Q/K/V load/store on platforms that
         # benefit from HW 2D block reads (Intel Xe2/Xe3).  The dead branch
@@ -584,6 +625,33 @@ class TritonAttentionImpl(AttentionImpl):
             )
 
         # Per-token-head quantized KV cache: use separate scale caches.
+        if self._is_packed_int_per_token_head:
+            assert self.kv_cache_k_bits is not None and self.kv_cache_v_bits is not None
+            head_size_v = getattr(layer, "head_size_v", self.head_size)
+            layout = PackedIntPerTokenHeadLayout.create(
+                k_bits=self.kv_cache_k_bits,
+                v_bits=self.kv_cache_v_bits,
+                head_size=self.head_size,
+                head_size_v=head_size_v,
+                padded_bytes_per_token_head=kv_cache.shape[-1],
+            )
+            self._ensure_packed_int_views(kv_cache, layout)
+            paged_attention_packed_int(
+                q=query[:num_actual_tokens],
+                key_cache=self._packed_int_key_cache,
+                value_cache=self._packed_int_value_cache,
+                k_scale_cache=self._k_scale_cache,
+                v_scale_cache=self._v_scale_cache,
+                out=output[:num_actual_tokens],
+                query_start_loc=attn_metadata.query_start_loc,
+                seq_lens=attn_metadata.seq_lens,
+                block_table=attn_metadata.block_table,
+                layout=layout,
+                softmax_scale=self.scale,
+                num_queries_per_kv=self.num_queries_per_kv,
+                sliding_window=self.sliding_window,
+            )
+            return output
         if self._is_per_token_head_quant:
             self._ensure_scale_caches(kv_cache)
             key_cache, value_cache = kv_cache.unbind(1)
@@ -730,6 +798,27 @@ class TritonAttentionImpl(AttentionImpl):
             # we use direct Q, K, V tensors without caching
             return
         # Reshape the input keys and values and store them in the cache.
+        if self._is_packed_int_per_token_head:
+            assert self.kv_cache_k_bits is not None and self.kv_cache_v_bits is not None
+            layout = PackedIntPerTokenHeadLayout.create(
+                k_bits=self.kv_cache_k_bits,
+                v_bits=self.kv_cache_v_bits,
+                head_size=key.shape[-1],
+                head_size_v=value.shape[-1],
+                padded_bytes_per_token_head=kv_cache.shape[-1],
+            )
+            self._ensure_packed_int_views(kv_cache, layout)
+            reshape_and_cache_packed_int_per_token_head(
+                key,
+                value,
+                self._packed_int_key_cache,
+                self._packed_int_value_cache,
+                self._k_scale_cache,
+                self._v_scale_cache,
+                slot_mapping,
+                layout,
+            )
+            return
         if self._is_per_token_head_quant:
             self._ensure_scale_caches(kv_cache)
             key_cache, value_cache = kv_cache.unbind(1)

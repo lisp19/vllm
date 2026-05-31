@@ -216,13 +216,14 @@ def _reshape_kv_cache(
                     kv_cache_spec.num_kv_heads,
                     kv_cache_spec.head_size,
                     cache_dtype_str=cache_dtype,
+                    packed_int_layout=kv_cache_spec.packed_int_layout,
                 )
 
                 # FIXME(woosuk): Add kv_cache_stride_order to all attention backends.
                 try:
                     kv_cache_stride_order = group.backend.get_kv_cache_stride_order()
                     assert len(kv_cache_stride_order) == len(kv_cache_shape)
-                except (AttributeError, NotImplementedError):
+                except (AttributeError, NotImplementedError, AssertionError):
                     kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
 
                 kv_cache_shape = tuple(kv_cache_shape[i] for i in kv_cache_stride_order)
@@ -327,6 +328,7 @@ def _update_hybrid_attention_layout(
             kv_cache_spec.num_kv_heads,
             kv_cache_spec.head_size,
             cache_dtype_str=cache_dtype,
+            packed_int_layout=kv_cache_spec.packed_int_layout,
         )
         # if the first dim of the kvcache's layout is already num_blocks, continue
         if block_dim == 0:

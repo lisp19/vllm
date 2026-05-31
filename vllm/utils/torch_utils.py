@@ -40,6 +40,9 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "fp8_e5m2": torch.uint8,
     "int8": torch.int8,
     "int8_per_token_head": torch.int8,
+    "int8_k_int4_v_per_token_head": torch.uint8,
+    "int4_per_token_head": torch.uint8,
+    "intx_k_inty_v_per_token_head": torch.uint8,
     "fp8_per_token_head": torch.uint8,
     "fp8_inc": torch.float8_e4m3fn,
     "fp8_ds_mla": torch.uint8,
@@ -48,6 +51,12 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "turboquant_k3v4_nc": torch.uint8,
     "turboquant_3bit_nc": torch.uint8,
     "nvfp4": torch.uint8,
+}
+
+PACKED_INT_PER_TOKEN_HEAD_DTYPES = {
+    "int8_k_int4_v_per_token_head",
+    "int4_per_token_head",
+    "intx_k_inty_v_per_token_head",
 }
 
 TORCH_DTYPE_TO_NUMPY_DTYPE = {
@@ -84,6 +93,52 @@ def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
 def kv_cache_uses_per_token_head_scales(kv_cache_dtype: str) -> bool:
     """Return True if *kv_cache_dtype* needs per-token-head scales."""
     return kv_cache_dtype.endswith("per_token_head")
+
+
+def is_packed_int_per_token_head_kv_cache(kv_cache_dtype: str) -> bool:
+    return kv_cache_dtype in PACKED_INT_PER_TOKEN_HEAD_DTYPES
+
+
+def resolve_packed_int_per_token_head_bits(
+    kv_cache_dtype: str,
+    k_bits: int | None,
+    v_bits: int | None,
+) -> tuple[int | None, int | None]:
+    if kv_cache_dtype == "int8_k_int4_v_per_token_head":
+        resolved = (8, 4)
+    elif kv_cache_dtype == "int4_per_token_head":
+        resolved = (4, 4)
+    elif kv_cache_dtype == "intx_k_inty_v_per_token_head":
+        if k_bits is None or v_bits is None:
+            raise ValueError(
+                "intx_k_inty_v_per_token_head requires both kv_cache_k_bits "
+                "and kv_cache_v_bits"
+            )
+        resolved = (k_bits, v_bits)
+    else:
+        if k_bits is not None or v_bits is not None:
+            raise ValueError(
+                "kv_cache_k_bits / kv_cache_v_bits are only valid for packed "
+                "int per-token-head KV cache modes"
+            )
+        return None, None
+
+    if k_bits is not None and k_bits != resolved[0]:
+        raise ValueError(
+            f"{kv_cache_dtype} requires kv_cache_k_bits={resolved[0]}, got {k_bits}"
+        )
+    if v_bits is not None and v_bits != resolved[1]:
+        raise ValueError(
+            f"{kv_cache_dtype} requires kv_cache_v_bits={resolved[1]}, got {v_bits}"
+        )
+
+    k_bits_resolved, v_bits_resolved = resolved
+    if not (2 <= k_bits_resolved <= 8 and 2 <= v_bits_resolved <= 8):
+        raise ValueError(
+            "Packed int per-token-head KV cache only supports bit widths in [2, 8], "
+            f"got k_bits={k_bits_resolved}, v_bits={v_bits_resolved}"
+        )
+    return resolved
 
 
 def is_strictly_contiguous(t: torch.Tensor) -> bool:

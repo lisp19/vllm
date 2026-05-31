@@ -29,6 +29,7 @@ from vllm.utils.torch_utils import (
     _encode_layer_name,
     _resolve_layer_name,
     direct_register_custom_op,
+    is_packed_int_per_token_head_kv_cache,
     kv_cache_dtype_str_to_dtype,
 )
 from vllm.v1.attention.backend import (
@@ -41,6 +42,7 @@ from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
+    PackedIntPerTokenHeadLayout,
     SlidingWindowSpec,
     get_kv_quant_mode,
 )
@@ -278,6 +280,14 @@ class Attention(nn.Module, AttentionLayerBase):
             kv_cache_dtype, vllm_config.model_config
         )
         self.kv_cache_dtype = kv_cache_dtype
+        if cache_config is not None and is_packed_int_per_token_head_kv_cache(
+            kv_cache_dtype
+        ):
+            self.kv_cache_k_bits = cache_config.kv_cache_k_bits
+            self.kv_cache_v_bits = cache_config.kv_cache_v_bits
+        else:
+            self.kv_cache_k_bits = None
+            self.kv_cache_v_bits = None
         self.calculate_kv_scales = calculate_kv_scales
         if num_kv_heads is None:
             num_kv_heads = num_heads
@@ -324,6 +334,10 @@ class Attention(nn.Module, AttentionLayerBase):
         self.use_alibi_sqrt = bool(use_alibi_sqrt)
         if backend_supports_alibi_sqrt:
             extra_impl_args["use_alibi_sqrt"] = self.use_alibi_sqrt
+        if self.kv_cache_k_bits is not None:
+            extra_impl_args["kv_cache_k_bits"] = self.kv_cache_k_bits
+        if self.kv_cache_v_bits is not None:
+            extra_impl_args["kv_cache_v_bits"] = self.kv_cache_v_bits
         # prefix caching + batch invariance is currently not supported for
         # FLASHINFER and TRITON_MLA.
         if (
@@ -593,6 +607,27 @@ class Attention(nn.Module, AttentionLayerBase):
         # Should not be called for enc-dec or encoder-only attention.
         assert self.attn_type == AttentionType.DECODER
         quant_mode = get_kv_quant_mode(self.kv_cache_dtype)
+        packed_int_layout = None
+        if is_packed_int_per_token_head_kv_cache(self.kv_cache_dtype):
+            assert self.kv_cache_k_bits is not None and self.kv_cache_v_bits is not None
+            padded_bytes_per_token_head = None
+            if page_size_padded is not None:
+                denom = block_size * self.num_kv_heads
+                if page_size_padded % denom != 0:
+                    raise ValueError(
+                        "Packed-int page_size_padded must be divisible by "
+                        "block_size * num_kv_heads: "
+                        f"page_size_padded={page_size_padded}, "
+                        f"block_size={block_size}, num_kv_heads={self.num_kv_heads}"
+                    )
+                padded_bytes_per_token_head = page_size_padded // denom
+            packed_int_layout = PackedIntPerTokenHeadLayout.create(
+                k_bits=self.kv_cache_k_bits,
+                v_bits=self.kv_cache_v_bits,
+                head_size=self.head_size,
+                head_size_v=self.head_size_v,
+                padded_bytes_per_token_head=padded_bytes_per_token_head,
+            )
         if self.sliding_window is not None:
             assert not vllm_config.model_config.use_mla, (
                 "MLA is not supported for slidingwindow"
@@ -606,6 +641,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 kv_quant_mode=quant_mode,
                 sliding_window=self.sliding_window,
                 page_size_padded=page_size_padded,
+                packed_int_layout=packed_int_layout,
             )
         elif self.kv_cache_dtype.startswith("turboquant_"):
             from vllm.model_executor.layers.quantization.turboquant.config import (
@@ -634,6 +670,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 dtype=self.kv_cache_torch_dtype,
                 kv_quant_mode=quant_mode,
                 page_size_padded=page_size_padded,
+                packed_int_layout=packed_int_layout,
             )
 
 

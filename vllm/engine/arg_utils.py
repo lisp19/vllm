@@ -434,6 +434,8 @@ class EngineArgs:
     config_format: str = ModelConfig.config_format
     dtype: ModelDType = ModelConfig.dtype
     kv_cache_dtype: CacheDType = CacheConfig.cache_dtype
+    kv_cache_k_bits: int | None = CacheConfig.kv_cache_k_bits
+    kv_cache_v_bits: int | None = CacheConfig.kv_cache_v_bits
     seed: int = ModelConfig.seed
     max_model_len: int = ModelConfig.max_model_len
     cudagraph_capture_sizes: list[int] | None = (
@@ -1127,6 +1129,8 @@ class EngineArgs:
             "--kv-cache-memory-bytes", **cache_kwargs["kv_cache_memory_bytes"]
         )
         cache_group.add_argument("--kv-cache-dtype", **cache_kwargs["cache_dtype"])
+        cache_group.add_argument("--kv-cache-k-bits", **cache_kwargs["kv_cache_k_bits"])
+        cache_group.add_argument("--kv-cache-v-bits", **cache_kwargs["kv_cache_v_bits"])
         cache_group.add_argument(
             "--num-gpu-blocks-override", **cache_kwargs["num_gpu_blocks_override"]
         )
@@ -1761,6 +1765,8 @@ class EngineArgs:
             gpu_memory_utilization=self.gpu_memory_utilization,
             kv_cache_memory_bytes=self.kv_cache_memory_bytes,
             cache_dtype=resolved_cache_dtype,  # type: ignore[arg-type]
+            kv_cache_k_bits=self.kv_cache_k_bits,
+            kv_cache_v_bits=self.kv_cache_v_bits,
             is_attention_free=model_config.is_attention_free,
             num_gpu_blocks_override=self.num_gpu_blocks_override,
             sliding_window=sliding_window,
