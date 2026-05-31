@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python, PyTorch, Triton, vLLM v1 attention backend, Docker CUDA build.
 
-**Execution constraints:** finish implementation for all three branches before starting runtime validation; use staged commits during development; reuse a built image until code changes require rebuilding.
+**Execution constraints:** finish implementation for all three branches before starting runtime validation; use staged commits during development; reuse a built image until code changes require rebuilding; during debugging, overlay-style replacement is allowed for faster iteration, but any final report must be backed by a fresh build; kernel work may use static validation code before full runtime startup.
 
 ---
 

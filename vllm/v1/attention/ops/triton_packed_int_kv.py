@@ -214,17 +214,20 @@ def _decode_packed_signed(
     stride_cache_3: tl.int64,
     bit_width: tl.constexpr,
     dim_idx,
+    decode_mask,
 ):
     bit_pos = dim_idx * bit_width
     byte_idx = bit_pos // 8
     bit_off = bit_pos % 8
-    low = tl.load(cache_ptr + byte_base + byte_idx * stride_cache_3, other=0).to(
-        tl.int32
-    )
+    low = tl.load(
+        cache_ptr + byte_base + byte_idx * stride_cache_3,
+        mask=decode_mask,
+        other=0,
+    ).to(tl.int32)
     needs_high = bit_off + bit_width > 8
     high = tl.load(
         cache_ptr + byte_base + (byte_idx + 1) * stride_cache_3,
-        mask=needs_high,
+        mask=decode_mask & needs_high,
         other=0,
     ).to(tl.int32)
     code = low >> bit_off
@@ -257,6 +260,7 @@ def _load_packed_k_tile(
     offs_d = tl.arange(0, HEAD_SIZE_PADDED)
     dim_mask = offs_d < HEAD_SIZE
     slot_in_block = seq_offset % BLOCK_SIZE
+    decode_mask = dim_mask[:, None] & tile_mask[None, :]
     scale_idx = (
         physical_block_idx * stride_ks_blk
         + slot_in_block * stride_ks_slot
@@ -274,9 +278,10 @@ def _load_packed_k_tile(
         stride_k_cache_3,
         K_BITS,
         offs_d[:, None],
+        decode_mask,
     )
     decoded = decoded * k_scales[None, :]
-    return tl.where(dim_mask[:, None] & tile_mask[None, :], decoded, 0.0)
+    return tl.where(decode_mask, decoded, 0.0)
 
 
 @triton.jit
@@ -302,6 +307,7 @@ def _load_packed_v_tile(
     offs_d = tl.arange(0, HEAD_SIZE_V_PADDED)
     dim_mask = offs_d < HEAD_SIZE_V
     slot_in_block = seq_offset % BLOCK_SIZE
+    decode_mask = tile_mask[:, None] & dim_mask[None, :]
     scale_idx = (
         physical_block_idx * stride_vs_blk
         + slot_in_block * stride_vs_slot
@@ -319,9 +325,10 @@ def _load_packed_v_tile(
         stride_v_cache_3,
         V_BITS,
         offs_d[None, :],
+        decode_mask,
     )
     decoded = decoded * v_scales[:, None]
-    return tl.where(tile_mask[:, None] & dim_mask[None, :], decoded, 0.0)
+    return tl.where(decode_mask, decoded, 0.0)
 
 
 @triton.jit
@@ -481,6 +488,8 @@ def kernel_packed_int_attention(
             HEAD_SIZE_V_PADDED,
             V_BITS,
         )
+        K = K.to(Q.dtype)
+        V = V.to(Q.dtype)
 
         query_abs_pos = context_len + query_pos[:, None]
         seq_mask = query_abs_pos >= seq_offset[None, :]
