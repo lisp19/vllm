@@ -484,7 +484,13 @@ class TritonAttentionImpl(AttentionImpl):
         kv_cache: torch.Tensor,
         layout: PackedIntPerTokenHeadLayout,
     ) -> None:
-        if self._packed_int_layout == layout and self._packed_int_key_cache is not None:
+        if (
+            self._packed_int_layout == layout
+            and self._packed_int_key_cache is not None
+            and self._packed_int_value_cache is not None
+            and self._k_scale_cache is not None
+            and self._v_scale_cache is not None
+        ):
             return
         (
             self._packed_int_key_cache,
