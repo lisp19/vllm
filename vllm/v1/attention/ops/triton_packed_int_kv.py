@@ -14,6 +14,17 @@ def _quant_bounds(bits: int) -> tuple[int, int]:
     return qmax, qmin
 
 
+def _per_token_head_scale(values: torch.Tensor, qmax: int, bits: int) -> torch.Tensor:
+    abs_values = values.abs()
+    if bits <= 3:
+        numel = abs_values.shape[-1]
+        kth = max(1, (numel * 99 + 99) // 100)
+        scale_base = abs_values.kthvalue(kth, dim=-1).values
+    else:
+        scale_base = abs_values.amax(dim=-1)
+    return torch.clamp(scale_base / float(qmax), min=1e-6).to(torch.float32)
+
+
 def _pack_signed_values(values: torch.Tensor, bits: int) -> torch.Tensor:
     values_i32 = values.to(torch.int32)
     mask = (1 << bits) - 1
@@ -143,12 +154,8 @@ def reshape_and_cache_packed_int_per_token_head(
 
     k_qmax, k_qmin = _quant_bounds(layout.k_bits)
     v_qmax, v_qmin = _quant_bounds(layout.v_bits)
-    k_scale = torch.clamp(key_valid.abs().amax(dim=-1) / float(k_qmax), min=1e-6).to(
-        torch.float32
-    )
-    v_scale = torch.clamp(value_valid.abs().amax(dim=-1) / float(v_qmax), min=1e-6).to(
-        torch.float32
-    )
+    k_scale = _per_token_head_scale(key_valid, k_qmax, layout.k_bits)
+    v_scale = _per_token_head_scale(value_valid, v_qmax, layout.v_bits)
 
     key_q = torch.clamp(
         torch.round(key_valid / k_scale.unsqueeze(-1)), k_qmin, k_qmax
