@@ -127,6 +127,9 @@ define_extension_target(
   USE_SABI 3.11
   WITH_SOABI)
 
+target_compile_options(spinloop PRIVATE
+  $<$<COMPILE_LANGUAGE:CXX>:-UPy_LIMITED_API>)
+
 #
 # Forward the non-CUDA device extensions to external CMake scripts.
 #
