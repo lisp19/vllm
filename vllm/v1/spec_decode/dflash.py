@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import replace
 from typing import Any
 
 import torch
@@ -70,14 +69,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
 
     @override
     def _create_draft_vllm_config(self) -> VllmConfig:
-        base = super()._create_draft_vllm_config()
-        return replace(
-            base,
-            attention_config=replace(
-                base.attention_config,
-                use_non_causal=True,
-            ),
-        )
+        return super()._create_draft_vllm_config()
 
     @override
     def _raise_if_multimodal(self):
@@ -282,7 +274,22 @@ class DFlashProposer(SpecDecodeBaseProposer):
         per_group, per_layer = super().build_per_group_and_layer_attn_metadata(
             cad, draft_index
         )
-        sliding_layer_names = getattr(self.model, "sliding_attention_layer_names", set())
+        sliding_layer_names = getattr(
+            self.model, "sliding_attention_layer_names", set()
+        )
+
+        # Triton paged-KV decode only supports causal attention at backend
+        # selection / kernel entry, but it can extend the causal mask with
+        # bidirectional ranges via mm_prefix_range. For DFlash, the only
+        # bidirectional region needed is the per-request query-token suffix
+        # (bonus token + mask tokens). Keep backend selection causal-compatible
+        # and inject that suffix range directly into Triton metadata.
+        query_lens = cad.query_start_loc[1:] - cad.query_start_loc[:-1]
+        query_range_tensor = torch.stack(
+            (cad.seq_lens - query_lens, cad.seq_lens - 1), dim=-1
+        ).to(dtype=torch.int32)
+        query_range_tensor = query_range_tensor.unsqueeze(1).contiguous()
+
         if sliding_layer_names:
             causal_cad = cad.replace(causal=True)
             for attn_group in self.draft_attn_groups:
@@ -300,6 +307,15 @@ class DFlashProposer(SpecDecodeBaseProposer):
                 assert getattr(attn_metadata, "causal", None) is True, (
                     f"Attention metadata for sliding layer {layer_name} does not have"
                     " causal support, which is required for DFlash SWA."
+                )
+                continue
+            if hasattr(attn_metadata, "mm_prefix_range_tensor"):
+                attn_metadata.mm_prefix_range_tensor = query_range_tensor
+                assert (
+                    getattr(attn_metadata, "mm_prefix_range_tensor", None) is not None
+                ), (
+                    f"Attention metadata for layer {layer_name} is missing the "
+                    "query-token bidirectional mask required for DFlash."
                 )
                 continue
             assert getattr(attn_metadata, "causal", None) is False, (

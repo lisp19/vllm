@@ -379,6 +379,11 @@ class Attention(nn.Module, AttentionLayerBase):
             )
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
         self.kv_cache_page_size_padded = kv_cache_page_size_padded
+        self.kv_cache_page_size_padded_block_size = (
+            cache_config.block_size
+            if cache_config is not None and kv_cache_page_size_padded is not None
+            else None
+        )
 
         # use a placeholder kv cache tensor during init, which will be replaced
         # by bind_kv_cache
@@ -540,6 +545,23 @@ class Attention(nn.Module, AttentionLayerBase):
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         # Block size may get updated after model loading, refresh it
         block_size = vllm_config.cache_config.block_size
+        page_size_padded = self.kv_cache_page_size_padded
+        if (
+            page_size_padded is not None
+            and self.kv_cache_page_size_padded_block_size is not None
+            and self.kv_cache_page_size_padded_block_size != block_size
+        ):
+            scaled_padded = page_size_padded * block_size
+            if scaled_padded % self.kv_cache_page_size_padded_block_size != 0:
+                raise ValueError(
+                    "page_size_padded scaling must be divisible by original "
+                    f"block_size: page_size_padded={page_size_padded}, "
+                    f"old_block_size={self.kv_cache_page_size_padded_block_size}, "
+                    f"new_block_size={block_size}"
+                )
+            page_size_padded = (
+                scaled_padded // self.kv_cache_page_size_padded_block_size
+            )
         # Should not be called for enc-dec or encoder-only attention.
         assert self.attn_type == AttentionType.DECODER
         quant_mode = get_kv_quant_mode(self.kv_cache_dtype)
@@ -555,7 +577,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 dtype=self.kv_cache_torch_dtype,
                 kv_quant_mode=quant_mode,
                 sliding_window=self.sliding_window,
-                page_size_padded=self.kv_cache_page_size_padded,
+                page_size_padded=page_size_padded,
             )
         elif self.kv_cache_dtype.startswith("turboquant_"):
             from vllm.model_executor.layers.quantization.turboquant.config import (
@@ -573,7 +595,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 head_size_v=self.head_size,
                 dtype=self.kv_cache_torch_dtype,
                 tq_slot_size=tq_config.slot_size_aligned,
-                page_size_padded=self.kv_cache_page_size_padded,
+                page_size_padded=page_size_padded,
             )
         else:
             return FullAttentionSpec(
@@ -583,7 +605,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 head_size_v=self.head_size_v,
                 dtype=self.kv_cache_torch_dtype,
                 kv_quant_mode=quant_mode,
-                page_size_padded=self.kv_cache_page_size_padded,
+                page_size_padded=page_size_padded,
             )
 
 

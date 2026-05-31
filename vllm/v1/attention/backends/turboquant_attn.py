@@ -68,6 +68,7 @@ if _HAS_FLASH_ATTN:
 # kernel can read them efficiently. This avoids O(cached_len) dequant work
 # per continuation, eliminating the O(N²/chunk_size) collapse at long context.
 _CONTINUATION_DECODE_THRESHOLD = 128
+_NO_FLASH_ATTN_PREFILL_CHUNK_SIZE = 128
 
 
 def _build_hadamard(d: int, device_str: str) -> torch.Tensor:
@@ -632,17 +633,12 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         max_seqlen_k=q_len,
                     )
                 else:
-                    q_t = q_seq.transpose(0, 1).contiguous()
-                    k_t = k_seq.transpose(0, 1).contiguous()
-                    v_t = v_seq.transpose(0, 1).contiguous()
-                    out = F.scaled_dot_product_attention(
-                        q_t,
-                        k_t,
-                        v_t,
-                        is_causal=True,
-                        scale=self.scale,
-                        enable_gqa=use_gqa,
-                    ).transpose(0, 1)
+                    out = self._chunked_prefill_sdpa_fallback(
+                        q_seq,
+                        k_seq,
+                        v_seq,
+                        _arange_cache,
+                    )
                 output[q_start:q_end] = out.to(query.dtype)
             else:
                 # Continuation chunk: tokens already stored to TQ cache
@@ -671,6 +667,17 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         norm_correction=self.tq_config.norm_correction,
                         PiT=PiT,
                     )
+                elif not self._can_use_flash_attn_prefill:
+                    out = self._chunked_continuation_prefill_fallback(
+                        q_seq,
+                        kv_cache,
+                        attn_metadata.block_table[i : i + 1],
+                        cached_len,
+                        _arange_cache,
+                        Pi,
+                        centroids,
+                        PiT,
+                    )
                 else:
                     # Large continuation: dequant cached K/V and use
                     # flash_attn for better throughput.
@@ -687,6 +694,79 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         centroids,
                     )
                 output[q_start:q_end] = out.to(query.dtype)
+
+        return output
+
+    def _chunked_prefill_sdpa_fallback(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        arange_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run first-chunk prefill in bounded query chunks on no-FA GPUs."""
+        q_len, Hq, D = query.shape
+        Hk = key.shape[1]
+        use_gqa = Hk < Hq
+        device = query.device
+
+        output = torch.empty(q_len, Hq, D, dtype=query.dtype, device=device)
+        for chunk_start in range(0, q_len, _NO_FLASH_ATTN_PREFILL_CHUNK_SIZE):
+            chunk_end = min(chunk_start + _NO_FLASH_ATTN_PREFILL_CHUNK_SIZE, q_len)
+            q_chunk = query[chunk_start:chunk_end]
+            k_prefix = key[:chunk_end]
+            v_prefix = value[:chunk_end]
+            q_pos = arange_cache[chunk_start:chunk_end].unsqueeze(1)
+            k_pos = arange_cache[:chunk_end].unsqueeze(0)
+            mask = k_pos <= q_pos
+            out = F.scaled_dot_product_attention(
+                q_chunk.transpose(0, 1).unsqueeze(0),
+                k_prefix.transpose(0, 1).unsqueeze(0),
+                v_prefix.transpose(0, 1).unsqueeze(0),
+                attn_mask=mask,
+                scale=self.scale,
+                enable_gqa=use_gqa,
+            )
+            output[chunk_start:chunk_end] = out[0].transpose(0, 1)
+        return output
+
+    def _chunked_continuation_prefill_fallback(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        cached_len: int,
+        arange_cache: torch.Tensor,
+        Pi: torch.Tensor,
+        centroids: torch.Tensor,
+        PiT: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Run continuation prefill in bounded decode-style chunks on no-FA GPUs."""
+        q_len, Hq, D = query.shape
+        output = torch.empty(q_len, Hq, D, dtype=query.dtype, device=query.device)
+
+        for chunk_start in range(0, q_len, _NO_FLASH_ATTN_PREFILL_CHUNK_SIZE):
+            chunk_end = min(chunk_start + _NO_FLASH_ATTN_PREFILL_CHUNK_SIZE, q_len)
+            seq_lens = arange_cache[
+                cached_len + chunk_start + 1 : cached_len + chunk_end + 1
+            ]
+            chunk_out = triton_turboquant_decode_attention(
+                query=query[chunk_start:chunk_end],
+                kv_cache=kv_cache,
+                block_table=block_table.expand(chunk_end - chunk_start, -1),
+                seq_lens=seq_lens,
+                Pi=Pi,
+                centroids=centroids,
+                scale=self.scale,
+                mse_bits=self.tq_config.key_mse_bits,
+                key_packed_size=self.tq_config.key_packed_size,
+                value_quant_bits=self.tq_config.effective_value_quant_bits,
+                key_fp8=self.tq_config.key_fp8,
+                norm_correction=self.tq_config.norm_correction,
+                PiT=PiT,
+                max_num_kv_splits=self.max_num_kv_splits,
+            )
+            output[chunk_start:chunk_end] = chunk_out
 
         return output
 

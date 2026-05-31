@@ -553,6 +553,20 @@ class MambaSpec(KVCacheSpec):
     mamba_cache_mode: str = "none"
     num_speculative_blocks: int = 0
 
+    def copy_with_new_block_size(self, block_size: int) -> Self:
+        if self.page_size_padded is not None:
+            scaled_padded = self.page_size_padded * block_size
+            if scaled_padded % self.block_size != 0:
+                raise ValueError(
+                    "page_size_padded scaling must be divisible by original "
+                    f"block_size: page_size_padded={self.page_size_padded}, "
+                    f"old_block_size={self.block_size}, "
+                    f"new_block_size={block_size}"
+                )
+            new_padded = scaled_padded // self.block_size
+            return replace(self, block_size=block_size, page_size_padded=new_padded)
+        return super().copy_with_new_block_size(block_size)
+
     @property
     def page_size_bytes(self) -> int:
         page_size = sum(

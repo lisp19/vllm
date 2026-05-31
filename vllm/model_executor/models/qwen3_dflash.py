@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 from collections.abc import Iterable
 
 import torch
@@ -33,6 +34,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.multimodal.inputs import NestedTensors
 from vllm.transformers_utils.config import set_default_rope_theta
+from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, get_dtype_size
 from vllm.v1.attention.backend import AttentionType
 
 from .qwen2 import Qwen2MLP as Qwen3MLP
@@ -48,6 +50,9 @@ logger = init_logger(__name__)
 
 
 _DFLASH_VALID_LAYER_TYPES = frozenset({"full_attention", "sliding_attention"})
+_DFLASH_PER_TOKEN_HEAD_KV_CACHE_DTYPES = frozenset(
+    {"int8_per_token_head", "fp8_per_token_head"}
+)
 
 
 def _get_dflash_layer_types(config: Qwen3Config) -> tuple[str, ...]:
@@ -71,6 +76,99 @@ def _get_dflash_layer_types(config: Qwen3Config) -> tuple[str, ...]:
     return tuple(layer_types)
 
 
+def _get_per_token_head_kv_page_size_bytes(
+    *,
+    block_size: int,
+    num_kv_heads: int,
+    head_size: int,
+    cache_dtype: str,
+) -> int:
+    cache_torch_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_dtype]
+    kv_data_bytes = (
+        2 * block_size * num_kv_heads * head_size * get_dtype_size(cache_torch_dtype)
+    )
+    kv_scale_bytes = 2 * block_size * num_kv_heads * get_dtype_size(torch.float32)
+    return kv_data_bytes + kv_scale_bytes
+
+
+def _get_dflash_kv_cache_page_size_padded(
+    *,
+    vllm_config: VllmConfig,
+    cache_config: CacheConfig | None,
+    draft_num_kv_heads: int,
+    draft_head_size: int,
+    prefix: str,
+) -> int | None:
+    if cache_config is None:
+        return None
+
+    cache_dtype = cache_config.cache_dtype
+    if cache_dtype not in _DFLASH_PER_TOKEN_HEAD_KV_CACHE_DTYPES:
+        return None
+
+    model_config = vllm_config.model_config
+    if model_config is None:
+        raise ValueError(
+            f"Unable to derive target KV geometry for DFlash layer {prefix}: "
+            "vllm_config.model_config is None."
+        )
+    if model_config.use_mla:
+        raise ValueError(
+            f"Unable to derive target-compatible KV page size for DFlash layer "
+            f"{prefix}: MLA target models are not supported by this targeted "
+            "per-token-head KV fix."
+        )
+
+    block_size = cache_config.block_size
+    target_num_kv_heads = model_config.get_num_kv_heads(vllm_config.parallel_config)
+    target_head_size = model_config.get_head_size()
+    if block_size <= 0 or target_num_kv_heads <= 0 or target_head_size <= 0:
+        raise ValueError(
+            f"Unable to derive target-compatible KV page size for DFlash layer "
+            f"{prefix}: invalid target KV geometry block_size={block_size}, "
+            f"num_kv_heads={target_num_kv_heads}, head_size={target_head_size}."
+        )
+
+    target_page_size = _get_per_token_head_kv_page_size_bytes(
+        block_size=block_size,
+        num_kv_heads=target_num_kv_heads,
+        head_size=target_head_size,
+        cache_dtype=cache_dtype,
+    )
+    draft_page_size = _get_per_token_head_kv_page_size_bytes(
+        block_size=block_size,
+        num_kv_heads=draft_num_kv_heads,
+        head_size=draft_head_size,
+        cache_dtype=cache_dtype,
+    )
+    cache_torch_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_dtype]
+    cache_dtype_size = get_dtype_size(cache_torch_dtype)
+    draft_shape_stride_bytes = 2 * block_size * draft_num_kv_heads * cache_dtype_size
+    draft_scale_pad = get_dtype_size(torch.float32) // cache_dtype_size
+    # Per-token-head KV page size includes scale metadata. That means the target
+    # model's per-page byte size is not necessarily an upper bound for the DFlash
+    # draft layer even when their raw KV data bytes are comparable. Instead, pad
+    # the draft to the smallest page size that is both:
+    # 1) a multiple of the target page size, so generic page-size unification can
+    #    enlarge smaller target specs to this same physical page size; and
+    # 2) aligned with the draft KV cache shape stride, so runtime reshaping can
+    #    restore a valid logical KV cache view.
+    target_compatible_page_size = math.lcm(target_page_size, draft_shape_stride_bytes)
+    if target_compatible_page_size < draft_page_size:
+        target_compatible_page_size *= (
+            draft_page_size + target_compatible_page_size - 1
+        ) // target_compatible_page_size
+
+    draft_padded_last_dim = target_compatible_page_size // draft_shape_stride_bytes
+    if draft_padded_last_dim < draft_head_size + draft_scale_pad:
+        raise ValueError(
+            f"Unable to derive target-compatible KV page size for DFlash layer "
+            f"{prefix}: padded last dim {draft_padded_last_dim} is smaller than "
+            f"required draft last dim {draft_head_size + draft_scale_pad}."
+        )
+    return target_compatible_page_size
+
+
 class DFlashQwen3Attention(nn.Module):
     """Attention for DFlash speculative decoding.
 
@@ -80,6 +178,7 @@ class DFlashQwen3Attention(nn.Module):
 
     def __init__(
         self,
+        vllm_config: VllmConfig,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
@@ -111,6 +210,13 @@ class DFlashQwen3Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
+        kv_cache_page_size_padded = _get_dflash_kv_cache_page_size_padded(
+            vllm_config=vllm_config,
+            cache_config=cache_config,
+            draft_num_kv_heads=self.num_kv_heads,
+            draft_head_size=self.head_dim,
+            prefix=f"{prefix}.attn",
+        )
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -142,6 +248,7 @@ class DFlashQwen3Attention(nn.Module):
             cache_config=cache_config,
             quant_config=quant_config,
             per_layer_sliding_window=sliding_window,
+            kv_cache_page_size_padded=kv_cache_page_size_padded,
             prefix=f"{prefix}.attn",
             attn_type=attn_type,
         )
@@ -200,6 +307,7 @@ class DFlashQwen3DecoderLayer(nn.Module):
         )
 
         self.self_attn = DFlashQwen3Attention(
+            vllm_config=vllm_config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             max_position=config.max_position_embeddings,
@@ -261,6 +369,12 @@ class DFlashQwen3Model(nn.Module):
         self.config = vllm_config.speculative_config.draft_model_config.hf_config
         self.vocab_size = self.config.vocab_size
         self.quant_config = get_draft_quant_config(vllm_config)
+        if self.quant_config is not None:
+            raise ValueError(
+                "DFlashQwen3 currently supports only non-quantized draft models. "
+                "Please use an fp16/bf16 draft model for this path. "
+                "Quantized draft compatibility requires separate DFlash support."
+            )
 
         drafter_config = getattr(self.config, "eagle_config", {})
         drafter_config.update(getattr(self.config, "dflash_config", {}))
@@ -283,6 +397,8 @@ class DFlashQwen3Model(nn.Module):
             [
                 DFlashQwen3DecoderLayer(
                     current_vllm_config,
+                    cache_config=vllm_config.cache_config,
+                    quant_config=self.quant_config,
                     prefix=maybe_prefix(prefix, f"layers.{layer_idx + start_layer_id}"),
                     config=self.config,
                     layer_type=self.layer_types[layer_idx],
@@ -633,6 +749,9 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         needs_squeeze = hidden_states.dim() == 1
         if needs_squeeze:
             hidden_states = hidden_states.unsqueeze(0)
+        target_dtype = self.model.fc.weight.dtype
+        if hidden_states.dtype != target_dtype:
+            hidden_states = hidden_states.to(dtype=target_dtype)
         result = self.model.fc(hidden_states)
         if needs_squeeze:
             result = result.squeeze(0)
