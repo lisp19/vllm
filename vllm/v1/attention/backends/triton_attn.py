@@ -140,6 +140,16 @@ class TritonAttentionMetadata:
 class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMetadata]):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
 
+    @classmethod
+    def get_cudagraph_support(
+        cls,
+        vllm_config: VllmConfig,
+        kv_cache_spec: AttentionSpec,
+    ) -> AttentionCGSupport:
+        if kv_cache_spec.packed_int_layout is not None:
+            return AttentionCGSupport.NEVER
+        return cls._cudagraph_support
+
     def __init__(
         self,
         kv_cache_spec: AttentionSpec,
