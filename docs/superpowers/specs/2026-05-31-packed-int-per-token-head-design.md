@@ -71,8 +71,19 @@ The Triton backend adds a packed-int path alongside the existing
 - backend view extraction reconstructs packed key/value views and scale views
 - cache-update dispatch selects specialized 8/4, specialized 4/4, or generic
   packed-int writer
-- attention forward dispatch selects specialized or generic packed-int decode
-  logic
+- attention forward uses a dedicated Triton tiled packed-int attention kernel
+  instead of a Python path that materializes dense K/V or a full score matrix
+
+## Long-context production requirement
+
+The packed-int read path must be production-usable under long engineering
+prompts. That requires avoiding a fallback implementation that:
+
+- fully materializes dense K/V for a whole sequence
+- allocates a full `Q @ K^T` score matrix
+
+Instead, the packed-int path must unpack/dequantize tile-by-tile inside a
+Triton kernel and accumulate with an online softmax loop.
 
 ## Gemma4 padding
 

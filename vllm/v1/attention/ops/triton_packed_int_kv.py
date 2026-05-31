@@ -5,6 +5,14 @@ from __future__ import annotations
 
 import torch
 
+from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
+from vllm.utils.mem_utils import get_max_shared_memory_bytes
+from vllm.v1.attention.ops.triton_attention_helpers import (
+    apply_softcap,
+    resolve_seq_and_query_len,
+    softmax_step,
+)
 from vllm.v1.kv_cache_interface import PackedIntPerTokenHeadLayout
 
 
@@ -199,6 +207,312 @@ def _materialize_sequence_kv(
     return key, value
 
 
+@triton.jit
+def _decode_packed_signed(
+    cache_ptr,
+    byte_base,
+    stride_cache_3: tl.int64,
+    bit_width: tl.constexpr,
+    dim_idx,
+):
+    bit_pos = dim_idx * bit_width
+    byte_idx = bit_pos // 8
+    bit_off = bit_pos % 8
+    low = tl.load(cache_ptr + byte_base + byte_idx * stride_cache_3, other=0).to(
+        tl.int32
+    )
+    needs_high = bit_off + bit_width > 8
+    high = tl.load(
+        cache_ptr + byte_base + (byte_idx + 1) * stride_cache_3,
+        mask=needs_high,
+        other=0,
+    ).to(tl.int32)
+    code = low >> bit_off
+    code = tl.where(needs_high, code | (high << (8 - bit_off)), code)
+    code = code & ((1 << bit_width) - 1)
+    sign_bit = 1 << (bit_width - 1)
+    return tl.where(code >= sign_bit, code - (1 << bit_width), code).to(tl.float32)
+
+
+@triton.jit
+def _load_packed_k_tile(
+    key_cache_ptr,
+    physical_block_idx,
+    kv_head_idx,
+    seq_offset,
+    tile_mask,
+    stride_k_cache_0: tl.int64,
+    stride_k_cache_1: tl.int64,
+    stride_k_cache_2: tl.int64,
+    stride_k_cache_3: tl.int64,
+    stride_ks_blk: tl.int64,
+    stride_ks_slot: tl.int64,
+    stride_ks_head: tl.int64,
+    k_scale_cache_ptr,
+    BLOCK_SIZE: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    HEAD_SIZE_PADDED: tl.constexpr,
+    K_BITS: tl.constexpr,
+):
+    offs_d = tl.arange(0, HEAD_SIZE_PADDED)
+    dim_mask = offs_d < HEAD_SIZE
+    slot_in_block = seq_offset % BLOCK_SIZE
+    scale_idx = (
+        physical_block_idx * stride_ks_blk
+        + slot_in_block * stride_ks_slot
+        + kv_head_idx * stride_ks_head
+    )
+    k_scales = tl.load(k_scale_cache_ptr + scale_idx, mask=tile_mask, other=1.0)
+    byte_base = (
+        physical_block_idx[None, :] * stride_k_cache_0
+        + slot_in_block[None, :] * stride_k_cache_1
+        + kv_head_idx * stride_k_cache_2
+    )
+    decoded = _decode_packed_signed(
+        key_cache_ptr,
+        byte_base,
+        stride_k_cache_3,
+        K_BITS,
+        offs_d[:, None],
+    )
+    decoded = decoded * k_scales[None, :]
+    return tl.where(dim_mask[:, None] & tile_mask[None, :], decoded, 0.0)
+
+
+@triton.jit
+def _load_packed_v_tile(
+    value_cache_ptr,
+    physical_block_idx,
+    kv_head_idx,
+    seq_offset,
+    tile_mask,
+    stride_v_cache_0: tl.int64,
+    stride_v_cache_1: tl.int64,
+    stride_v_cache_2: tl.int64,
+    stride_v_cache_3: tl.int64,
+    stride_vs_blk: tl.int64,
+    stride_vs_slot: tl.int64,
+    stride_vs_head: tl.int64,
+    v_scale_cache_ptr,
+    BLOCK_SIZE: tl.constexpr,
+    HEAD_SIZE_V: tl.constexpr,
+    HEAD_SIZE_V_PADDED: tl.constexpr,
+    V_BITS: tl.constexpr,
+):
+    offs_d = tl.arange(0, HEAD_SIZE_V_PADDED)
+    dim_mask = offs_d < HEAD_SIZE_V
+    slot_in_block = seq_offset % BLOCK_SIZE
+    scale_idx = (
+        physical_block_idx * stride_vs_blk
+        + slot_in_block * stride_vs_slot
+        + kv_head_idx * stride_vs_head
+    )
+    v_scales = tl.load(v_scale_cache_ptr + scale_idx, mask=tile_mask, other=1.0)
+    byte_base = (
+        physical_block_idx[:, None] * stride_v_cache_0
+        + slot_in_block[:, None] * stride_v_cache_1
+        + kv_head_idx * stride_v_cache_2
+    )
+    decoded = _decode_packed_signed(
+        value_cache_ptr,
+        byte_base,
+        stride_v_cache_3,
+        V_BITS,
+        offs_d[None, :],
+    )
+    decoded = decoded * v_scales[:, None]
+    return tl.where(tile_mask[:, None] & dim_mask[None, :], decoded, 0.0)
+
+
+@triton.jit
+def kernel_packed_int_attention(
+    output_ptr,
+    query_ptr,
+    key_cache_ptr,
+    value_cache_ptr,
+    block_tables_ptr,
+    seq_lens_ptr,
+    scale,
+    softcap,
+    num_query_heads: tl.constexpr,
+    num_queries_per_kv: tl.constexpr,
+    block_table_stride: tl.int64,
+    query_stride_0: tl.int64,
+    query_stride_1: tl.int64,
+    output_stride_0: tl.int64,
+    output_stride_1: tl.int64,
+    stride_k_cache_0: tl.int64,
+    stride_k_cache_1: tl.int64,
+    stride_k_cache_2: tl.int64,
+    stride_k_cache_3: tl.int64,
+    stride_v_cache_0: tl.int64,
+    stride_v_cache_1: tl.int64,
+    stride_v_cache_2: tl.int64,
+    stride_v_cache_3: tl.int64,
+    stride_ks_blk: tl.int64,
+    stride_ks_slot: tl.int64,
+    stride_ks_head: tl.int64,
+    stride_vs_blk: tl.int64,
+    stride_vs_slot: tl.int64,
+    stride_vs_head: tl.int64,
+    k_scale_cache_ptr,
+    v_scale_cache_ptr,
+    query_start_len_ptr,
+    BLOCK_Q: tl.constexpr,
+    num_seqs: tl.int32,
+    BLOCK_M: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    HEAD_SIZE_PADDED: tl.constexpr,
+    HEAD_SIZE_V: tl.constexpr,
+    HEAD_SIZE_V_PADDED: tl.constexpr,
+    K_BITS: tl.constexpr,
+    V_BITS: tl.constexpr,
+    USE_SOFTCAP: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr,
+):
+    q_block_global_idx = tl.program_id(0)
+    kv_head_idx = tl.program_id(1)
+
+    (
+        seq_idx,
+        q_block_local_idx,
+        cur_batch_in_all_start_index,
+        cur_batch_query_len,
+        seq_len,
+    ) = resolve_seq_and_query_len(
+        query_start_len_ptr, seq_lens_ptr, q_block_global_idx, num_seqs, BLOCK_Q
+    )
+
+    if q_block_local_idx * BLOCK_Q >= cur_batch_query_len:
+        return
+
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_d_q = tl.arange(0, HEAD_SIZE_PADDED)
+    offs_d_v = tl.arange(0, HEAD_SIZE_V_PADDED)
+    offs_t = tl.arange(0, TILE_SIZE)
+
+    query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
+    query_offset_0 = cur_batch_in_all_start_index + query_pos
+    query_offset_1 = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv
+    query_offset = (
+        query_offset_0[:, None] * query_stride_0
+        + query_offset_1[:, None] * query_stride_1
+        + offs_d_q[None, :]
+    )
+
+    dim_mask_q = tl.where(offs_d_q < HEAD_SIZE, 1, 0).to(tl.int1)
+    dim_mask_v = tl.where(offs_d_v < HEAD_SIZE_V, 1, 0).to(tl.int1)
+    query_mask_0 = tl.where(query_pos < cur_batch_query_len, 1, 0).to(tl.int1)
+    query_mask_1 = tl.where(query_offset_1 < num_query_heads, 1, 0).to(tl.int1)
+
+    Q = tl.load(
+        query_ptr + query_offset,
+        mask=dim_mask_q[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
+        other=0.0,
+    )
+
+    block_table_offset = seq_idx * block_table_stride
+    M = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    L = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_SIZE_V_PADDED], dtype=tl.float32)
+    context_len = seq_len - cur_batch_query_len
+    max_seq_prefix_len = tl.minimum(
+        context_len
+        + q_block_local_idx * BLOCK_Q
+        + (BLOCK_M - 1) // num_queries_per_kv
+        + 1,
+        seq_len,
+    )
+    num_tiles = (max_seq_prefix_len + TILE_SIZE - 1) // TILE_SIZE
+
+    tile_start = 0
+    if SLIDING_WINDOW > 0:
+        qpos_lo = q_block_local_idx * BLOCK_Q
+        q_abs = context_len + qpos_lo
+        first_allowed_key = q_abs - SLIDING_WINDOW + 1
+        tile_start = tl.maximum(0, first_allowed_key // TILE_SIZE)
+
+    for j in range(tile_start, num_tiles):
+        seq_offset = j * TILE_SIZE + offs_t
+        tile_mask = seq_offset < max_seq_prefix_len
+        physical_block_idx = tl.load(
+            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE,
+            mask=tile_mask,
+            other=0,
+        ).to(tl.int64)
+
+        K = _load_packed_k_tile(
+            key_cache_ptr,
+            physical_block_idx,
+            kv_head_idx,
+            seq_offset,
+            tile_mask,
+            stride_k_cache_0,
+            stride_k_cache_1,
+            stride_k_cache_2,
+            stride_k_cache_3,
+            stride_ks_blk,
+            stride_ks_slot,
+            stride_ks_head,
+            k_scale_cache_ptr,
+            BLOCK_SIZE,
+            HEAD_SIZE,
+            HEAD_SIZE_PADDED,
+            K_BITS,
+        )
+        V = _load_packed_v_tile(
+            value_cache_ptr,
+            physical_block_idx,
+            kv_head_idx,
+            seq_offset,
+            tile_mask,
+            stride_v_cache_0,
+            stride_v_cache_1,
+            stride_v_cache_2,
+            stride_v_cache_3,
+            stride_vs_blk,
+            stride_vs_slot,
+            stride_vs_head,
+            v_scale_cache_ptr,
+            BLOCK_SIZE,
+            HEAD_SIZE_V,
+            HEAD_SIZE_V_PADDED,
+            V_BITS,
+        )
+
+        query_abs_pos = context_len + query_pos[:, None]
+        seq_mask = query_abs_pos >= seq_offset[None, :]
+        if SLIDING_WINDOW > 0:
+            seq_mask = seq_mask & (query_abs_pos - seq_offset[None, :] < SLIDING_WINDOW)
+
+        S = tl.dot(Q, K) * scale
+        if USE_SOFTCAP:
+            S = apply_softcap(S, softcap)
+        S = tl.where(
+            query_mask_1[:, None] & query_mask_0[:, None] & seq_mask,
+            S,
+            float("-inf"),
+        )
+
+        M, L, P, alpha = softmax_step(S, M, L)
+        acc = acc * alpha[:, None]
+        acc += tl.dot(P.to(V.dtype), V)
+
+    acc = acc / L[:, None]
+    output_offset = (
+        query_offset_0[:, None] * output_stride_0
+        + query_offset_1[:, None] * output_stride_1
+        + offs_d_v[None, :]
+    )
+    tl.store(
+        output_ptr + output_offset,
+        acc,
+        mask=dim_mask_v[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
+    )
+
+
 def paged_attention_packed_int(
     q: torch.Tensor,
     key_cache: torch.Tensor,
@@ -216,50 +530,81 @@ def paged_attention_packed_int(
     num_queries_per_kv: int,
     sliding_window: tuple[int, int],
 ) -> None:
-    num_reqs = query_start_loc.shape[0] - 1
-    block_size = key_cache.shape[1]
-    window = 1 + sliding_window[0] if sliding_window[0] >= 0 else None
+    block_size = value_cache.shape[1]
+    num_seqs = len(seq_lens)
+    num_query_heads = q.shape[1]
+    num_kv_heads = key_cache.shape[2]
+    head_size = q.shape[2]
+    head_size_v = out.shape[2]
 
-    for req_idx in range(num_reqs):
-        q_start = int(query_start_loc[req_idx].item())
-        q_end = int(query_start_loc[req_idx + 1].item())
-        q_len = q_end - q_start
-        if q_len <= 0:
-            continue
-        seq_len = int(seq_lens[req_idx].item())
-        context_len = seq_len - q_len
-        key_seq, value_seq = _materialize_sequence_kv(
-            key_cache,
-            value_cache,
-            k_scale_cache,
-            v_scale_cache,
-            block_table[req_idx],
-            seq_len,
-            block_size,
-            layout,
+    block_m = (
+        16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
+    )
+    block_q = block_m // num_queries_per_kv
+    total_num_q_blocks = q.shape[0] // block_q + num_seqs
+    sliding_window_val = 1 + sliding_window[0] if sliding_window[0] >= 0 else 0
+    tile_size = 32 if q.element_size() == 1 else 16
+    if (
+        tile_size == 32
+        and triton.next_power_of_2(head_size) >= 512
+        and q.element_size() >= 2
+    ):
+        max_shared_memory = (
+            get_max_shared_memory_bytes() if current_platform.is_cuda() else 65536
         )
-        key_seq = key_seq.repeat_interleave(num_queries_per_kv, dim=1).permute(1, 0, 2)
-        value_seq = value_seq.repeat_interleave(num_queries_per_kv, dim=1).permute(
-            1, 0, 2
-        )
-        q_seq = q[q_start:q_end].permute(1, 0, 2).to(torch.float32)
+        if max_shared_memory < 98304:
+            tile_size = 16
 
-        query_abs = context_len + torch.arange(
-            q_len, device=q.device, dtype=torch.int64
-        )
-        key_pos = torch.arange(seq_len, device=q.device, dtype=torch.int64)
-        keep = key_pos.unsqueeze(0) <= query_abs.unsqueeze(1)
-        if window is not None:
-            keep = keep & (
-                key_pos.unsqueeze(0) >= (query_abs.unsqueeze(1) - window + 1)
-            )
-        attn_bias = torch.zeros((q_len, seq_len), device=q.device, dtype=torch.float32)
-        attn_bias.masked_fill_(~keep, float("-inf"))
+    head_size_padded = triton.next_power_of_2(head_size)
+    head_size_v_padded = triton.next_power_of_2(head_size_v)
+    num_warps = 8 if head_size_padded >= 256 else 4
+    grid = (total_num_q_blocks, num_kv_heads)
 
-        scores = torch.matmul(q_seq, key_seq.transpose(-1, -2)) * softmax_scale
-        if softcap > 0:
-            scores = softcap * torch.tanh(scores / softcap)
-        scores = scores + attn_bias.unsqueeze(0)
-        probs = torch.softmax(scores, dim=-1)
-        attn_out = torch.matmul(probs, value_seq)
-        out[q_start:q_end].copy_(attn_out.permute(1, 0, 2).to(out.dtype))
+    kernel_packed_int_attention[grid](
+        output_ptr=out,
+        query_ptr=q,
+        key_cache_ptr=key_cache,
+        value_cache_ptr=value_cache,
+        block_tables_ptr=block_table,
+        seq_lens_ptr=seq_lens,
+        scale=softmax_scale,
+        softcap=softcap,
+        num_query_heads=num_query_heads,
+        num_queries_per_kv=num_queries_per_kv,
+        block_table_stride=block_table.stride(0),
+        query_stride_0=q.stride(0),
+        query_stride_1=q.stride(1),
+        output_stride_0=out.stride(0),
+        output_stride_1=out.stride(1),
+        stride_k_cache_0=key_cache.stride(0),
+        stride_k_cache_1=key_cache.stride(1),
+        stride_k_cache_2=key_cache.stride(2),
+        stride_k_cache_3=key_cache.stride(3),
+        stride_v_cache_0=value_cache.stride(0),
+        stride_v_cache_1=value_cache.stride(1),
+        stride_v_cache_2=value_cache.stride(2),
+        stride_v_cache_3=value_cache.stride(3),
+        stride_ks_blk=k_scale_cache.stride(0),
+        stride_ks_slot=k_scale_cache.stride(1),
+        stride_ks_head=k_scale_cache.stride(2),
+        stride_vs_blk=v_scale_cache.stride(0),
+        stride_vs_slot=v_scale_cache.stride(1),
+        stride_vs_head=v_scale_cache.stride(2),
+        k_scale_cache_ptr=k_scale_cache,
+        v_scale_cache_ptr=v_scale_cache,
+        query_start_len_ptr=query_start_loc,
+        BLOCK_Q=block_q,
+        num_seqs=num_seqs,
+        BLOCK_M=block_m,
+        BLOCK_SIZE=block_size,
+        TILE_SIZE=tile_size,
+        HEAD_SIZE=head_size,
+        HEAD_SIZE_PADDED=head_size_padded,
+        HEAD_SIZE_V=head_size_v,
+        HEAD_SIZE_V_PADDED=head_size_v_padded,
+        K_BITS=layout.k_bits,
+        V_BITS=layout.v_bits,
+        USE_SOFTCAP=(softcap > 0),
+        SLIDING_WINDOW=sliding_window_val,
+        num_warps=num_warps,
+    )

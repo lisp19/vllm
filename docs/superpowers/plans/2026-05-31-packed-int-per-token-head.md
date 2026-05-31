@@ -4,7 +4,7 @@
 
 **Goal:** add three lower-memory packed-int per-token-head KV cache modes and verify all three with the original Gemma4 runtime arguments.
 
-**Architecture:** build one generic packed-int metadata and allocation chain, then hang `8/4` and `4/4` specialized runtime paths off that shared chain. Keep Gemma4 padding logic hard-coded and keep all public signature changes optional.
+**Architecture:** build one generic packed-int metadata and allocation chain, then hang `8/4` and `4/4` specialized runtime paths off that shared chain. Use a dedicated Triton tiled packed-int attention kernel for the read path so long-context requests avoid dense whole-sequence K/V materialization and full score-matrix allocation. Keep Gemma4 padding logic hard-coded and keep all public signature changes optional.
 
 **Tech Stack:** Python, PyTorch, Triton, vLLM v1 attention backend, Docker CUDA build.
 
@@ -73,6 +73,9 @@
 - [ ] Add specialized `8/4` cache-write and decode path.
 - [ ] Add specialized `4/4` cache-write and decode path.
 - [ ] Add generic `x/y` cache-write and decode path for `2..8` bits.
+- [ ] Replace the packed-int Python whole-sequence attention fallback with a
+  dedicated Triton tiled kernel that unpacks/dequantizes in-kernel and uses
+  online softmax accumulation.
 
 ## Task 6: Build and runtime-verify all three chains
 
@@ -85,6 +88,8 @@
 - [ ] Validate `int4_per_token_head` using the original runtime args, changing only docker auto-restart and KV cache type.
 - [ ] Validate `intx_k_inty_v_per_token_head` using the original runtime args, changing only docker auto-restart, KV cache type, and the new K/V bit flags.
 - [ ] For the generic branch, validate multiple combinations covering even/even, odd/odd, divisible, and non-divisible packing.
+- [ ] Re-run the prepared long engineering prompt that previously OOMed on
+  `k4v3` and confirm the kernelized path returns a valid answer.
 
 ## Task 7: Summarize verified results
 
