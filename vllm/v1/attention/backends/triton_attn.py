@@ -39,9 +39,13 @@ from vllm.v1.attention.backends.utils import (
     get_num_attention_heads_from_layers,
 )
 from vllm.v1.attention.ops.triton_packed_int_kv import (
+    PackedIntAttentionKernelConfig,
+    PackedIntWriterKernelConfig,
+    _reshape_and_cache_packed_int_triton,
+    build_packed_int_attention_kernel_config,
+    build_packed_int_writer_kernel_config,
     get_packed_int_cache_views,
     paged_attention_packed_int,
-    reshape_and_cache_packed_int_per_token_head,
 )
 from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
@@ -147,7 +151,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         kv_cache_spec: AttentionSpec,
     ) -> AttentionCGSupport:
         if kv_cache_spec.packed_int_layout is not None:
-            return AttentionCGSupport.NEVER
+            return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
         return cls._cudagraph_support
 
     def __init__(
@@ -426,6 +430,19 @@ class TritonAttentionImpl(AttentionImpl):
     _packed_int_key_cache: torch.Tensor | None = None
     _packed_int_value_cache: torch.Tensor | None = None
     _packed_int_layout: PackedIntPerTokenHeadLayout | None = None
+    _packed_int_view_data_ptr: int | None = None
+    _packed_int_view_shape_0: int | None = None
+    _packed_int_view_shape_1: int | None = None
+    _packed_int_view_shape_2: int | None = None
+    _packed_int_view_shape_3: int | None = None
+    _packed_int_view_stride_0: int | None = None
+    _packed_int_view_stride_1: int | None = None
+    _packed_int_view_stride_2: int | None = None
+    _packed_int_view_stride_3: int | None = None
+    _packed_int_launch_config: PackedIntAttentionKernelConfig | None = None
+    _packed_int_launch_config_key: tuple[int, int, int, int, int] | None = None
+    _packed_int_writer_config: PackedIntWriterKernelConfig | None = None
+    _packed_int_writer_config_key: tuple[int, int, int, int] | None = None
 
     def _ensure_scale_caches(self, kv_cache: torch.Tensor) -> None:
         """Extract per-head scale views from the padded head dimension.
@@ -485,7 +502,16 @@ class TritonAttentionImpl(AttentionImpl):
         layout: PackedIntPerTokenHeadLayout,
     ) -> None:
         if (
-            self._packed_int_layout == layout
+            self._packed_int_view_data_ptr == kv_cache.data_ptr()
+            and self._packed_int_view_shape_0 == kv_cache.shape[0]
+            and self._packed_int_view_shape_1 == kv_cache.shape[1]
+            and self._packed_int_view_shape_2 == kv_cache.shape[2]
+            and self._packed_int_view_shape_3 == kv_cache.shape[3]
+            and self._packed_int_view_stride_0 == kv_cache.stride(0)
+            and self._packed_int_view_stride_1 == kv_cache.stride(1)
+            and self._packed_int_view_stride_2 == kv_cache.stride(2)
+            and self._packed_int_view_stride_3 == kv_cache.stride(3)
+            and self._packed_int_layout is layout
             and self._packed_int_key_cache is not None
             and self._packed_int_value_cache is not None
             and self._k_scale_cache is not None
@@ -499,6 +525,90 @@ class TritonAttentionImpl(AttentionImpl):
             self._v_scale_cache,
         ) = get_packed_int_cache_views(kv_cache, layout)
         self._packed_int_layout = layout
+        self._packed_int_view_data_ptr = kv_cache.data_ptr()
+        self._packed_int_view_shape_0 = kv_cache.shape[0]
+        self._packed_int_view_shape_1 = kv_cache.shape[1]
+        self._packed_int_view_shape_2 = kv_cache.shape[2]
+        self._packed_int_view_shape_3 = kv_cache.shape[3]
+        self._packed_int_view_stride_0 = kv_cache.stride(0)
+        self._packed_int_view_stride_1 = kv_cache.stride(1)
+        self._packed_int_view_stride_2 = kv_cache.stride(2)
+        self._packed_int_view_stride_3 = kv_cache.stride(3)
+
+    def _ensure_packed_int_writer_config(
+        self,
+        layout: PackedIntPerTokenHeadLayout,
+    ) -> PackedIntWriterKernelConfig:
+        key = (
+            layout.k_bits,
+            layout.v_bits,
+            layout.head_size,
+            layout.head_size_v,
+        )
+        if (
+            self._packed_int_writer_config is not None
+            and self._packed_int_writer_config_key == key
+        ):
+            return self._packed_int_writer_config
+        self._packed_int_writer_config = build_packed_int_writer_kernel_config(layout)
+        self._packed_int_writer_config_key = key
+        return self._packed_int_writer_config
+
+    def _get_packed_int_layout(
+        self,
+        *,
+        head_size: int,
+        head_size_v: int,
+        padded_bytes_per_token_head: int,
+    ) -> PackedIntPerTokenHeadLayout:
+        if (
+            self._packed_int_layout is not None
+            and self._packed_int_layout.k_bits == self.kv_cache_k_bits
+            and self._packed_int_layout.v_bits == self.kv_cache_v_bits
+            and self._packed_int_layout.head_size == head_size
+            and self._packed_int_layout.head_size_v == head_size_v
+            and self._packed_int_layout.padded_bytes_per_token_head
+            == padded_bytes_per_token_head
+        ):
+            return self._packed_int_layout
+        assert self.kv_cache_k_bits is not None and self.kv_cache_v_bits is not None
+        self._packed_int_layout = PackedIntPerTokenHeadLayout.create(
+            k_bits=self.kv_cache_k_bits,
+            v_bits=self.kv_cache_v_bits,
+            head_size=head_size,
+            head_size_v=head_size_v,
+            padded_bytes_per_token_head=padded_bytes_per_token_head,
+        )
+        return self._packed_int_layout
+
+    def _ensure_packed_int_launch_config(
+        self,
+        *,
+        q_element_size: int,
+        block_size: int,
+        head_size_v: int,
+    ) -> PackedIntAttentionKernelConfig:
+        key = (
+            q_element_size,
+            block_size,
+            head_size_v,
+            self.num_queries_per_kv,
+            self.sliding_window[0],
+        )
+        if (
+            self._packed_int_launch_config is not None
+            and self._packed_int_launch_config_key == key
+        ):
+            return self._packed_int_launch_config
+        self._packed_int_launch_config = build_packed_int_attention_kernel_config(
+            q_element_size=q_element_size,
+            head_size=self.head_size,
+            head_size_v=head_size_v,
+            num_queries_per_kv=self.num_queries_per_kv,
+            sliding_window=self.sliding_window,
+        )
+        self._packed_int_launch_config_key = key
+        return self._packed_int_launch_config
 
     def fused_output_quant_supported(self, quant_key: QuantKey):
         return quant_key == kFp8StaticTensorSym
@@ -644,14 +754,18 @@ class TritonAttentionImpl(AttentionImpl):
         if self._is_packed_int_per_token_head:
             assert self.kv_cache_k_bits is not None and self.kv_cache_v_bits is not None
             head_size_v = getattr(layer, "head_size_v", self.head_size)
-            layout = PackedIntPerTokenHeadLayout.create(
-                k_bits=self.kv_cache_k_bits,
-                v_bits=self.kv_cache_v_bits,
+            layout = self._get_packed_int_layout(
                 head_size=self.head_size,
                 head_size_v=head_size_v,
                 padded_bytes_per_token_head=kv_cache.shape[-1],
             )
             self._ensure_packed_int_views(kv_cache, layout)
+            assert self._packed_int_value_cache is not None
+            launch_config = self._ensure_packed_int_launch_config(
+                q_element_size=query.element_size(),
+                block_size=self._packed_int_value_cache.shape[1],
+                head_size_v=head_size_v,
+            )
             paged_attention_packed_int(
                 q=query[:num_actual_tokens],
                 key_cache=self._packed_int_key_cache,
@@ -667,6 +781,8 @@ class TritonAttentionImpl(AttentionImpl):
                 softcap=self.logits_soft_cap,
                 num_queries_per_kv=self.num_queries_per_kv,
                 sliding_window=self.sliding_window,
+                launch_config=launch_config,
+                max_query_len=attn_metadata.max_query_len,
             )
             return output
         if self._is_per_token_head_quant:
@@ -816,16 +932,14 @@ class TritonAttentionImpl(AttentionImpl):
             return
         # Reshape the input keys and values and store them in the cache.
         if self._is_packed_int_per_token_head:
-            assert self.kv_cache_k_bits is not None and self.kv_cache_v_bits is not None
-            layout = PackedIntPerTokenHeadLayout.create(
-                k_bits=self.kv_cache_k_bits,
-                v_bits=self.kv_cache_v_bits,
+            layout = self._get_packed_int_layout(
                 head_size=key.shape[-1],
                 head_size_v=value.shape[-1],
                 padded_bytes_per_token_head=kv_cache.shape[-1],
             )
             self._ensure_packed_int_views(kv_cache, layout)
-            reshape_and_cache_packed_int_per_token_head(
+            writer_config = self._ensure_packed_int_writer_config(layout)
+            _reshape_and_cache_packed_int_triton(
                 key,
                 value,
                 self._packed_int_key_cache,
@@ -834,6 +948,7 @@ class TritonAttentionImpl(AttentionImpl):
                 self._v_scale_cache,
                 slot_mapping,
                 layout,
+                writer_config,
             )
             return
         if self._is_per_token_head_quant:

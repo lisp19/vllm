@@ -67,7 +67,7 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
 
 from ...model_executor.model_loader import TensorizerLoader
-from .gpu.warmup import warmup_kernels
+from .gpu.warmup import warmup_kernels, warmup_slot_mapping_kernel
 from .utils import request_memory
 
 logger = init_logger(__name__)
@@ -685,30 +685,13 @@ class Worker(WorkerBase):
 
             logger.debug(msg)
 
-        if self.use_v2_model_runner:
-            # V2: Run full execute_model + sample_tokens to JIT compile triton kernels.
+        if self.use_v2_model_runner or get_pp_group().is_last_rank:
+            # Run a real execute_model + sample_tokens warmup for both V2 and
+            # legacy V1 runners. This covers request-shaped kernels such as
+            # slot-mapping computation and packed-int attention, which the V1
+            # dummy-run path does not exercise because it fills dummy slot
+            # mappings with PAD IDs and can skip attention entirely.
             warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
-        elif get_pp_group().is_last_rank:
-            # V1: Warm up sampler and preallocate memory buffer for logits and other
-            # sampling related tensors of max possible shape to avoid memory
-            # fragmentation issue.
-            # NOTE: This is called after `capture_model` on purpose to prevent
-            # memory buffers from being cleared by `torch.accelerator.empty_cache`.
-            max_num_reqs = min(
-                self.scheduler_config.max_num_seqs,
-                self.scheduler_config.max_num_batched_tokens,
-            )
-
-            # We skip EPLB here since we don't want to record dummy metrics
-            hidden_states, last_hidden_states = self.model_runner._dummy_run(
-                num_tokens=max_num_reqs,
-                skip_eplb=True,
-                cudagraph_runtime_mode=CUDAGraphMode.NONE,
-            )
-            if self.model_runner.is_pooling_model:
-                self.model_runner._dummy_pooler_run(hidden_states)
-            else:
-                self.model_runner._dummy_sampler_run(hidden_states=last_hidden_states)
 
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
@@ -721,6 +704,11 @@ class Worker(WorkerBase):
         )
 
         activate_triton_jit_monitor()
+        # A remaining real-path gap on V1 was that the first short request
+        # could still JIT-compile the Triton slot-mapping kernel even after the
+        # pre-activation warmup. Compile it once here so the latency spike is
+        # moved into startup instead of the first real request.
+        warmup_slot_mapping_kernel(self.model_runner, prompt_len=32)
 
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,

@@ -147,6 +147,15 @@ class BlockTable:
         num_tokens = positions.shape[0]
         total_cp_world_size = self.pcp_world_size * self.dcp_world_size
         total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
+        if num_reqs == 1:
+            self._compute_slot_mapping_eager(
+                num_tokens=num_tokens,
+                query_start_loc=query_start_loc,
+                positions=positions,
+                total_cp_world_size=total_cp_world_size,
+                total_cp_rank=total_cp_rank,
+            )
+            return
         _compute_slot_mapping_kernel[(num_reqs + 1,)](
             num_tokens,
             self.max_num_batched_tokens,
@@ -162,6 +171,51 @@ class BlockTable:
             PAD_ID=PAD_SLOT_ID,
             BLOCK_SIZE=1024,
         )
+
+    def _compute_slot_mapping_eager(
+        self,
+        num_tokens: int,
+        query_start_loc: torch.Tensor,
+        positions: torch.Tensor,
+        total_cp_world_size: int,
+        total_cp_rank: int,
+    ) -> None:
+        slot_mapping_gpu = self.slot_mapping.gpu
+        slot_mapping_gpu.fill_(PAD_SLOT_ID)
+
+        if num_tokens == 0:
+            return
+
+        start_idx = int(query_start_loc[0].item())
+        end_idx = int(query_start_loc[1].item())
+        if end_idx <= start_idx:
+            return
+
+        pos = positions[start_idx:end_idx]
+        virtual_block_size = self.block_size * total_cp_world_size
+        block_indices = torch.div(pos, virtual_block_size, rounding_mode="floor")
+        block_numbers = self.block_table.gpu[0, block_indices].to(torch.int64)
+
+        virtual_block_offsets = pos - block_indices * virtual_block_size
+        interleave = self.cp_kv_cache_interleave_size
+        is_local = (
+            torch.div(virtual_block_offsets, interleave, rounding_mode="floor")
+            % total_cp_world_size
+            == total_cp_rank
+        )
+        local_block_offsets = torch.div(
+            virtual_block_offsets,
+            total_cp_world_size * interleave,
+            rounding_mode="floor",
+        ) * interleave + (virtual_block_offsets % interleave)
+
+        slot_ids = block_numbers * self.block_size + local_block_offsets
+        slot_ids = torch.where(
+            is_local,
+            slot_ids,
+            torch.full_like(slot_ids, PAD_SLOT_ID),
+        )
+        slot_mapping_gpu[start_idx:end_idx].copy_(slot_ids, non_blocking=True)
 
     def commit_block_table(self, num_reqs: int) -> None:
         self.block_table.copy_to_gpu(num_reqs)

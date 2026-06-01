@@ -331,6 +331,38 @@ class Scheduler(SchedulerInterface):
                 pass
         return num_new_tokens
 
+    def _cap_prefill_chunk_tokens(
+        self,
+        request: Request,
+        num_new_tokens: int,
+    ) -> int:
+        threshold = self.scheduler_config.long_prefill_token_threshold
+        if 0 < threshold < num_new_tokens:
+            return threshold
+
+        if (
+            threshold != 0
+            or not self.scheduler_config.enable_chunked_prefill
+            or request.num_computed_tokens >= request.num_prompt_tokens
+        ):
+            return num_new_tokens
+
+        active_reqs = len(self.running) + len(self.waiting) + len(self.skipped_waiting)
+        if active_reqs != 1:
+            return num_new_tokens
+
+        single_req_cap = max(512, self.max_num_scheduled_tokens // 4)
+        if request.num_prompt_tokens <= single_req_cap:
+            return num_new_tokens
+
+        if request.num_prompt_tokens > self.max_num_scheduled_tokens:
+            single_req_cap = max(512, single_req_cap // 2)
+
+        # Keep very long single-request prefills interruptible. Without an
+        # explicit threshold, one step may consume the full scheduling budget,
+        # which delays abort handling until the worker returns.
+        return min(num_new_tokens, single_req_cap)
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -392,8 +424,7 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
-            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
-                num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+            num_new_tokens = self._cap_prefill_chunk_tokens(request, num_new_tokens)
             num_new_tokens = min(num_new_tokens, token_budget)
 
             # Make sure the input position does not exceed the max model len.
@@ -657,9 +688,9 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
-                    threshold = self.scheduler_config.long_prefill_token_threshold
-                    if 0 < threshold < num_new_tokens:
-                        num_new_tokens = threshold
+                    num_new_tokens = self._cap_prefill_chunk_tokens(
+                        request, num_new_tokens
+                    )
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
