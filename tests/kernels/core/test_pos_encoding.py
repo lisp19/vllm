@@ -9,6 +9,11 @@ import torch
 
 from tests.kernels.allclose_default import get_default_atol, get_default_rtol
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.rotary_embedding.common import (
+    yarn_find_correction_range,
+    yarn_get_mscale,
+    yarn_linear_ramp_mask,
+)
 from vllm.utils.torch_utils import set_random_seed
 
 IS_NEOX_STYLE = [True, False]
@@ -191,3 +196,91 @@ def test_rope_module_cache(default_vllm_config):
         )
         # check if cache take effect
         assert id(rope) == rope_setting_id_map[str(setting)]
+
+
+def _gemma4_proportional_yarn_reference_cache(
+    *,
+    head_size: int,
+    partial_rotary_factor: float,
+    max_position: int,
+    rope_theta: float,
+    scaling_factor: float,
+    beta_fast: int = 32,
+    beta_slow: int = 1,
+    extrapolation_factor: float = 1.0,
+    attn_factor: float = 1.0,
+    apply_yarn_scaling: bool = True,
+    truncate: bool = True,
+) -> torch.Tensor:
+    rope_angles = int(head_size * partial_rotary_factor) // 2
+    nope_angles = (head_size // 2) - rope_angles
+
+    freq_exponents = (
+        torch.arange(0, 2 * rope_angles, 2, dtype=torch.float32) / head_size
+    )
+    pos_freqs = rope_theta**freq_exponents
+    inv_freq_extrapolation = 1.0 / pos_freqs
+    inv_freq_interpolation = 1.0 / (scaling_factor * pos_freqs)
+
+    low, high = yarn_find_correction_range(
+        beta_fast,
+        beta_slow,
+        head_size,
+        rope_theta,
+        max_position,
+        truncate,
+    )
+    full_head_mask = (
+        1
+        - yarn_linear_ramp_mask(
+            low,
+            high,
+            head_size // 2,
+            dtype=torch.float32,
+        )
+    ) * extrapolation_factor
+    inv_freq_mask = full_head_mask[:rope_angles]
+    inv_freq = (
+        inv_freq_interpolation * (1 - inv_freq_mask)
+        + inv_freq_extrapolation * inv_freq_mask
+    )
+    if nope_angles > 0:
+        inv_freq = torch.cat(
+            (inv_freq, torch.zeros(nope_angles, dtype=torch.float32)),
+            dim=0,
+        )
+
+    t = torch.arange(int(max_position * scaling_factor), dtype=torch.float32)
+    freqs = torch.einsum("i,j->ij", t, inv_freq)
+    mscale = yarn_get_mscale(scaling_factor) if apply_yarn_scaling else 1.0
+    mscale *= attn_factor
+    return torch.cat((freqs.cos() * mscale, freqs.sin() * mscale), dim=-1)
+
+
+def test_gemma4_proportional_yarn_cache_matches_reference(default_vllm_config):
+    rope_parameters = {
+        "rope_type": "yarn",
+        "rope_theta": 1_000_000.0,
+        "factor": 2.0,
+        "original_max_position_embeddings": 262144,
+        "partial_rotary_factor": 0.25,
+        "gemma4_proportional_yarn": True,
+    }
+    rope = get_rope(
+        head_size=512,
+        max_position=524288,
+        is_neox_style=True,
+        rope_parameters=rope_parameters,
+        dtype=torch.float32,
+    )
+
+    expected = _gemma4_proportional_yarn_reference_cache(
+        head_size=512,
+        partial_rotary_factor=0.25,
+        max_position=262144,
+        rope_theta=1_000_000.0,
+        scaling_factor=2.0,
+    )
+
+    assert rope.cos_sin_cache.shape == (524288, 512)
+    torch.testing.assert_close(rope.cos_sin_cache, expected)

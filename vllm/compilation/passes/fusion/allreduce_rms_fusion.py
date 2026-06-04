@@ -68,6 +68,9 @@ if hasattr(torch.ops._C, "scaled_fp4_quant"):
 # Max size of the input tensor per world size per device capability
 # to use flashinfer fused allreduce
 FI_ALLREDUCE_FUSION_MAX_SIZE_MB: dict[int, dict[int, float]] = {
+    75: {
+        2: 8,  # 8MB, decode-oriented cap for SM75
+    },
     90: {
         2: 64,  # 64MB
         4: 2,  # 2MB

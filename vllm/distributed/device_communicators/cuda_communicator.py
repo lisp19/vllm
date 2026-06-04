@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import os
+
 import torch
 from torch.distributed import ProcessGroup
 
@@ -21,6 +23,11 @@ from ..utils import StatelessProcessGroup
 from .base_device_communicator import DeviceCommunicatorBase
 
 logger = init_logger(__name__)
+
+
+_AR_TRACE_ENABLED = os.getenv("VLLM_DEBUG_AR_TRACE", "0") == "1"
+_AR_TRACE_LIMIT = int(os.getenv("VLLM_DEBUG_AR_TRACE_LIMIT", "32"))
+_AR_TRACE_SKIP = int(os.getenv("VLLM_DEBUG_AR_TRACE_SKIP", "0"))
 
 
 class CudaCommunicator(DeviceCommunicatorBase):
@@ -117,6 +124,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         if self.world_size > 1:
             self._log_all_reduce_backend_selection()
+        self._debug_ar_trace_remaining = _AR_TRACE_LIMIT if _AR_TRACE_ENABLED else 0
+        self._debug_ar_trace_skip_remaining = _AR_TRACE_SKIP if _AR_TRACE_ENABLED else 0
 
         if self.use_all2all:
             if self.all2all_backend in ("naive", "allgather_reducescatter"):
@@ -244,6 +253,25 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
 
     def all_reduce(self, input_):
+        def maybe_log_choice(backend: str, inp: torch.Tensor) -> None:
+            if self._debug_ar_trace_skip_remaining > 0:
+                self._debug_ar_trace_skip_remaining -= 1
+                return
+            if self._debug_ar_trace_remaining <= 0:
+                return
+            self._debug_ar_trace_remaining -= 1
+            logger.warning(
+                "AR_TRACE group=%s backend=%s numel=%d bytes=%d dtype=%s "
+                "shape=%s capturing=%s",
+                self.unique_name or "<unnamed>",
+                backend,
+                inp.numel(),
+                inp.numel() * inp.element_size(),
+                str(inp.dtype),
+                tuple(inp.shape),
+                torch.cuda.is_current_stream_capturing(),
+            )
+
         # since currently we perform copy input -> symm_input -> out-of-place AR
         # return symm_output, we don't need to check if input is symmetric
         if self.pynccl_comm is not None and should_nccl_symm_mem_allreduce(
@@ -251,6 +279,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ):
             out = torch.ops.vllm.all_reduce_symmetric_with_copy(input_)
             if out is not None:
+                maybe_log_choice("NCCL_SYMM_MEM", input_)
                 return out
         # always try quick reduce first, then flashinfer, then custom allreduce,
         # and then pynccl. (quick reduce just for ROCM MI3*)
@@ -260,6 +289,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and not qr_comm.disabled
             and qr_comm.should_quick_allreduce(input_)
         ):
+            maybe_log_choice("QUICK_REDUCE", input_)
             out = qr_comm.quick_all_reduce(input_)
             assert out is not None
             return out
@@ -269,6 +299,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and not fi_ar_comm.disabled
             and fi_ar_comm.should_use_fi_ar(input_)
         ):
+            maybe_log_choice("FLASHINFER", input_)
             out = fi_ar_comm.all_reduce(input_)
             assert out is not None
             return out
@@ -278,26 +309,31 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and not ca_comm.disabled
             and ca_comm.should_custom_ar(input_)
         ):
+            maybe_log_choice("CUSTOM", input_)
             out = ca_comm.custom_all_reduce(input_)
             assert out is not None
             return out
         symm_mem_comm = self.symm_mem_comm
         if symm_mem_comm is not None and symm_mem_comm.should_use_symm_mem(input_):
+            maybe_log_choice("SYMM_MEM", input_)
             out = symm_mem_comm.all_reduce(input_)
             assert out is not None
             return out
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is None or pynccl_comm.disabled:
+            maybe_log_choice("TORCH_DIST", input_)
             out = input_.clone()
             torch.distributed.all_reduce(out, group=self.device_group)
             return out
         assert pynccl_comm is not None
+        maybe_log_choice("PYNCCL", input_)
         out = pynccl_comm.all_reduce(input_)
         if out is None:
             # fall back to the default all-reduce using PyTorch.
             # this usually happens during testing.
             # when we run the model, allreduce only happens for the TP
             # group, where we always have either custom allreduce or pynccl.
+            maybe_log_choice("TORCH_DIST_FALLBACK", input_)
             out = input_.clone()
             torch.distributed.all_reduce(out, group=self.device_group)
         return out

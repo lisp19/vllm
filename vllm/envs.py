@@ -111,6 +111,8 @@ if TYPE_CHECKING:
     VLLM_DISABLED_KERNELS: list[str] = []
     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
     VLLM_DISABLE_PYNCCL: bool = False
+    VLLM_CUSTOM_ALLREDUCE_MAX_SIZE_MB: int | None = None
+    VLLM_DEBUG_AR_TRACE_SKIP: int = 0
     VLLM_USE_OINK_OPS: bool = False
     VLLM_ROCM_USE_AITER: bool = False
     VLLM_ROCM_USE_AITER_PAGED_ATTN: bool = False
@@ -1079,6 +1081,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DISABLE_PYNCCL": lambda: (
         os.getenv("VLLM_DISABLE_PYNCCL", "False").lower() in ("true", "1")
     ),
+    # Optional override for CustomAllreduce max tensor size in MiB.
+    # Intended for controlled local tuning experiments.
+    "VLLM_CUSTOM_ALLREDUCE_MAX_SIZE_MB": lambda: (
+        None
+        if os.getenv("VLLM_CUSTOM_ALLREDUCE_MAX_SIZE_MB") is None
+        else int(os.getenv("VLLM_CUSTOM_ALLREDUCE_MAX_SIZE_MB", "0"))
+    ),
+    "VLLM_DEBUG_AR_TRACE_SKIP": lambda: int(os.getenv("VLLM_DEBUG_AR_TRACE_SKIP", "0")),
     # Optional: enable external Oink custom ops (e.g., Blackwell RMSNorm).
     # Disabled by default.
     "VLLM_USE_OINK_OPS": lambda: (

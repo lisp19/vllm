@@ -15,7 +15,7 @@ from .dual_chunk_rope import DualChunkRotaryEmbedding
 from .dynamic_ntk_alpha_rope import DynamicNTKAlphaRotaryEmbedding
 from .dynamic_ntk_scaling_rope import DynamicNTKScalingRotaryEmbedding
 from .fope import FourierRotaryEmbedding
-from .gemma4_rope import Gemma4RotaryEmbedding
+from .gemma4_rope import Gemma4RotaryEmbedding, Gemma4YaRNScalingRotaryEmbedding
 from .linear_scaling_rope import LinearScalingRotaryEmbedding
 from .llama3_rope import Llama3RotaryEmbedding
 from .llama4_vision_rope import Llama4VisionRotaryEmbedding
@@ -256,7 +256,18 @@ def get_rope(
                 "truncate",
             )
         }
-        if "mrope_section" in rope_parameters:
+        if rope_parameters.get("gemma4_proportional_yarn", False):
+            rotary_emb = Gemma4YaRNScalingRotaryEmbedding(
+                head_size,
+                rotary_dim,
+                original_max_position,
+                base,
+                is_neox_style,
+                scaling_factor,
+                dtype,
+                **extra_kwargs,
+            )
+        elif "mrope_section" in rope_parameters:
             extra_kwargs.pop("apply_yarn_scaling", None)
             rotary_emb = MRotaryEmbedding(
                 head_size,

@@ -510,6 +510,13 @@ class Gemma4Attention(nn.Module):
                     config, "rope_local_base_freq", 10000.0
                 )
 
+        if (
+            layer_type == "full_attention"
+            and rope_parameters.get("rope_type") == "yarn"
+        ):
+            # Preserve Gemma4 proportional/full-head rope semantics under YaRN.
+            rope_parameters["gemma4_proportional_yarn"] = True
+
         # KV sharing: layers in the last `num_kv_shared_layers` share KV
         # cache with earlier layers of the same type.
         kv_sharing_target_layer_name = None

@@ -380,7 +380,6 @@ class RequestState:
         stop_reason: int | str | None,
     ) -> CompletionOutput:
         assert self.detokenizer is not None
-        assert self.logprobs_processor is not None
         finished = finish_reason is not None
         delta = self.output_kind == RequestOutputKind.DELTA
 
@@ -388,6 +387,8 @@ class RequestState:
         text = self.detokenizer.get_next_output_text(finished, delta)
         if not delta:
             token_ids = self.detokenizer.output_token_ids
+
+        assert self.logprobs_processor is not None
 
         # Prepare logprobs, based on delta mode
         logprobs = self.logprobs_processor.logprobs
@@ -634,7 +635,6 @@ class OutputProcessor:
 
             if pooling_output is None:
                 assert req_state.detokenizer is not None
-                assert req_state.logprobs_processor is not None
                 # 2) Detokenize the token ids into text and perform stop checks.
                 stop_string = req_state.detokenizer.update(
                     new_token_ids, finish_reason == FinishReason.STOP

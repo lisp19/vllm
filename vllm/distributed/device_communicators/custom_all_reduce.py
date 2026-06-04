@@ -12,6 +12,7 @@ import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.distributed.device_communicators.all_reduce_utils import (
     CUSTOM_ALL_REDUCE_MAX_SIZES,
+    MiB,
     gpu_p2p_access_check,
 )
 from vllm.distributed.parallel_state import in_the_same_node_as
@@ -129,6 +130,22 @@ class CustomAllreduce:
                 max_size = min(
                     CUSTOM_ALL_REDUCE_MAX_SIZES[device_capability_str][world_size],
                     max_size,
+                )
+        custom_ar_max_size_mb = envs.VLLM_CUSTOM_ALLREDUCE_MAX_SIZE_MB
+        if custom_ar_max_size_mb is not None:
+            if custom_ar_max_size_mb < 1:
+                logger.warning(
+                    "Ignoring VLLM_CUSTOM_ALLREDUCE_MAX_SIZE_MB=%d because it "
+                    "must be >= 1.",
+                    custom_ar_max_size_mb,
+                )
+            else:
+                max_size = custom_ar_max_size_mb * MiB
+                logger.info(
+                    "CustomAllreduce: overriding max_size to %d bytes via "
+                    "VLLM_CUSTOM_ALLREDUCE_MAX_SIZE_MB=%d",
+                    max_size,
+                    custom_ar_max_size_mb,
                 )
         cuda_visible_devices = envs.CUDA_VISIBLE_DEVICES
         if cuda_visible_devices:
