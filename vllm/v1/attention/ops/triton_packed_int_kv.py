@@ -27,6 +27,7 @@ class PackedIntAttentionKernelConfig:
     head_size_padded: int
     head_size_v_padded: int
     num_warps: int
+    num_stages: int
 
 
 @dataclass(frozen=True)
@@ -145,6 +146,7 @@ def build_packed_int_attention_kernel_config(
         head_size_padded=head_size_padded,
         head_size_v_padded=head_size_v_padded,
         num_warps=num_warps,
+        num_stages=3,
     )
 
 
@@ -1336,6 +1338,7 @@ def paged_attention_packed_int(
             head_size_padded=launch_config.head_size_padded,
             head_size_v_padded=launch_config.head_size_v_padded,
             num_warps=launch_config.num_warps,
+            num_stages=launch_config.num_stages,
         )
     if (
         q.element_size() >= 2
@@ -1357,7 +1360,9 @@ def paged_attention_packed_int(
             head_size_padded=launch_config.head_size_padded,
             head_size_v_padded=launch_config.head_size_v_padded,
             num_warps=8,
+            num_stages=launch_config.num_stages,
         )
+
     block_m = launch_config.block_m
     block_q = launch_config.block_q
     total_num_q_blocks = q.shape[0] // block_q + num_seqs
@@ -1410,4 +1415,72 @@ def paged_attention_packed_int(
         USE_SOFTCAP=(softcap > 0),
         SLIDING_WINDOW=launch_config.sliding_window_val,
         num_warps=launch_config.num_warps,
+        num_stages=launch_config.num_stages,
     )
+
+
+def resolve_packed_int_attention_launch_config(
+    *,
+    q_element_size: int,
+    head_size: int,
+    head_size_v: int,
+    num_queries_per_kv: int,
+    sliding_window: tuple[int, int],
+    layout: PackedIntPerTokenHeadLayout,
+    launch_config: PackedIntAttentionKernelConfig | None = None,
+    max_query_len: int | None = None,
+    allow_single_query_override: bool = True,
+) -> PackedIntAttentionKernelConfig:
+    if launch_config is None:
+        launch_config = build_packed_int_attention_kernel_config(
+            q_element_size=q_element_size,
+            head_size=head_size,
+            head_size_v=head_size_v,
+            num_queries_per_kv=num_queries_per_kv,
+            sliding_window=sliding_window,
+        )
+    if (
+        allow_single_query_override
+        and max_query_len == 1
+        and q_element_size >= 2
+        and num_queries_per_kv == 2
+        and head_size == 256
+        and head_size_v == 256
+        and launch_config.sliding_window_val == 1024
+        and launch_config.tile_size == 16
+        and launch_config.num_warps == 4
+        and launch_config.block_m == 16
+    ):
+        launch_config = PackedIntAttentionKernelConfig(
+            block_q=4,
+            block_m=8,
+            sliding_window_val=launch_config.sliding_window_val,
+            tile_size=launch_config.tile_size,
+            head_size_padded=launch_config.head_size_padded,
+            head_size_v_padded=launch_config.head_size_v_padded,
+            num_warps=launch_config.num_warps,
+            num_stages=launch_config.num_stages,
+        )
+    if (
+        q_element_size >= 2
+        and max_query_len is not None
+        and max_query_len >= 512
+        and layout.k_bits == 5
+        and layout.v_bits == 4
+        and head_size == 512
+        and head_size_v == 512
+        and num_queries_per_kv == 8
+        and launch_config.sliding_window_val == 0
+        and launch_config.tile_size == 8
+    ):
+        launch_config = PackedIntAttentionKernelConfig(
+            block_q=2,
+            block_m=16,
+            sliding_window_val=launch_config.sliding_window_val,
+            tile_size=16,
+            head_size_padded=launch_config.head_size_padded,
+            head_size_v_padded=launch_config.head_size_v_padded,
+            num_warps=8,
+            num_stages=launch_config.num_stages,
+        )
+    return launch_config

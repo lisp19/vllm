@@ -190,6 +190,7 @@ def _benchmark_kernel_mode(
                 if packed_num_warps is None
                 else packed_num_warps
             ),
+            num_stages=packed_launch_config.num_stages,
         )
 
     packed_kwargs = dict(
